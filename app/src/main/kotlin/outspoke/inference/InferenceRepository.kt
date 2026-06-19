@@ -484,8 +484,20 @@ internal fun String.filterSpuriousPeriods(language: String = "en"): String {
  *   model's next partial starts mid-sentence (e.g. `"sind vielleicht noch falsch…"`), so
  *   capitalizing the first letter would produce `"Sind…"` which is wrong.  Sentence-internal
  *   capitalizations (letters following `.`, `!`, `?`) are always applied regardless.
+ * @param modelFirstWord The model's *original* first word (lowercased) of the raw transcript
+ *   before any upstream pipeline stage (filler removal, stutter collapse, leading-punct /
+ *   leading-dot strip) modified the prefix. When non-null, the [shouldRespectModelLowercase]
+ *   guard only fires if the first word currently being capitalised still equals this value —
+ *   i.e. nothing was stripped from the front. When the current first word differs (a leading
+ *   filler like "um" was removed, exposing "so" as the new utterance start), the guard is
+ *   suppressed so the exposed word IS capitalised as a genuine sentence start. `null` (the
+ *   default for direct / structural-only callers) means "assume the first word is the
+ *   model's first word" — the guard fires as before.
  */
-internal fun String.applySentenceCapitalization(skipInitialCapitalize: Boolean = false): String {
+internal fun String.applySentenceCapitalization(
+    skipInitialCapitalize: Boolean = false,
+    modelFirstWord: String? = null,
+): String {
     if (this.isBlank()) return this
     val text = this.trim()
     val builder = StringBuilder(text.length)
@@ -520,8 +532,19 @@ internal fun String.applySentenceCapitalization(skipInitialCapitalize: Boolean =
             // start arrives capitalised, so this guard never suppresses a real sentence
             // start — only the drifted-continuation case the model itself flagged as
             // non-sentence-initial by emitting it lowercase.
+            //
+            // modelFirstWord gate: only apply this guard when the first word being
+            // capitalised is STILL the model's original first word (i.e. no upstream stage
+            // stripped leading content). If filler removal ("um so I…" → "so I…") or any
+            // other prefix-removing stage exposed a new first word, that word IS the real
+            // utterance start now and must be capitalised even though the model emitted it
+            // lowercase (it was mid-sentence in the model's raw output). Without this gate
+            // the guard would wrongly leave "so I was saying hello." lowercase.
+            val currentFirstWord = peekWord(text, i).lowercase()
+            val isFirstWordIntact = modelFirstWord == null || currentFirstWord == modelFirstWord
             val shouldRespectModelLowercase = isFirstCapitalize && c.isLowerCase() &&
-                    peekWord(text, i).lowercase() in SHOULD_STAY_LOWERCASE
+                    isFirstWordIntact &&
+                    currentFirstWord in SHOULD_STAY_LOWERCASE
             if (shouldGuard || shouldRespectModelLowercase) {
                 builder.append(c)
             } else {
@@ -558,6 +581,27 @@ private fun peekWord(text: String, start: Int): String {
 }
 
 /**
+ * Returns the first letter-word of [s], lowercased — skipping any leading non-letter
+ * characters (punctuation, whitespace, digits). Empty when [s] has no letter word.
+ *
+ * Used to capture the model's *original* first word at the top of the cleaning pipeline
+ * (before filler removal / stutter collapse / leading-punct strip) so that
+ * [applySentenceCapitalization] can tell whether the word it is about to (not) capitalise
+ * is still the model's genuine first word or one exposed by upstream leading-content
+ * removal. See [applySentenceCapitalization]'s `modelFirstWord` parameter.
+ */
+private fun firstWordLowercased(s: String): String {
+    val sb = StringBuilder()
+    var i = 0
+    while (i < s.length && !s[i].isLetter()) i++
+    while (i < s.length && s[i].isLetter()) {
+        sb.append(s[i])
+        i++
+    }
+    return sb.toString().lowercase()
+}
+
+/**
  * Words that should NOT be capitalised when they follow a sentence-boundary period,
  * because they are almost certainly mid-sentence (prepositions, articles, conjunctions,
  * common adverbs — English + German).
@@ -585,8 +629,18 @@ private val SHOULD_STAY_LOWERCASE = setOf(
  *
  * @param isContinuation When `true`, the very first letter of the result is **not**
  *   capitalized (used after an audio window trim).
+ * @param modelFirstWord The model's original first word (lowercased) captured before any
+ *   prefix-removing stage, threaded through to [applySentenceCapitalization] so its
+ *   model-lowercase guard only fires when the first word is still the model's genuine
+ *   first word. `null` (default for direct / partial-path callers) means "assume the first
+ *   word is the model's first word" — the guard fires as before. The full
+ *   [cleanTranscript] pipeline passes a real value so that leading-filler removal does not
+ *   wrongly suppress capitalisation of the exposed sentence start.
  */
-internal fun String.cleanTranscriptStructural(isContinuation: Boolean = false): String {
+internal fun String.cleanTranscriptStructural(
+    isContinuation: Boolean = false,
+    modelFirstWord: String? = null,
+): String {
     if (isBlank()) {
         Log.d(TAG, "[CLEAN] blank input → discarded")
         return ""
@@ -608,7 +662,10 @@ internal fun String.cleanTranscriptStructural(isContinuation: Boolean = false): 
         "[CLEAN:SENT_SPACE]  \"${afterTrailDots.trim()}\" → \"$afterSentSpace\""
     )
 
-    val afterCaps = afterSentSpace.applySentenceCapitalization(skipInitialCapitalize = isContinuation)
+    val afterCaps = afterSentSpace.applySentenceCapitalization(
+        skipInitialCapitalize = isContinuation,
+        modelFirstWord = modelFirstWord,
+    )
     if (afterCaps != afterSentSpace) Log.d(TAG, "[CLEAN:CAPITALIZE]  \"$afterSentSpace\" → \"$afterCaps\"")
 
     return if (afterCaps.none { it.isLetterOrDigit() }) {
@@ -643,6 +700,15 @@ internal fun String.cleanTranscript(
     }
     val input = trim()
 
+    // Capture the model's original first word BEFORE any prefix-removing stage (filler
+    // removal, stutter collapse, phrase dedup, spurious-period filter, leading-punct /
+    // leading-dot strip) so that applySentenceCapitalization's model-lowercase guard only
+    // fires when the first word is still the model's genuine first word. Without this, a
+    // leading filler like "um so I was saying…" would have "um" stripped, exposing "so" —
+    // and the guard would wrongly keep "so" lowercase instead of capitalising the now-real
+    // sentence start.
+    val modelFirstWord = firstWordLowercased(input)
+
     val afterFillers = input.removeFillerWords(language)
     if (afterFillers != input) Log.d(TAG, "[CLEAN:FILLERS]     \"$input\" → \"$afterFillers\"")
 
@@ -668,7 +734,7 @@ internal fun String.cleanTranscript(
         "[CLEAN:SPURIOUS_P]  \"$afterDedup\" → \"$afterSpuriousPeriods\""
     )
 
-    return afterSpuriousPeriods.cleanTranscriptStructural(isContinuation)
+    return afterSpuriousPeriods.cleanTranscriptStructural(isContinuation, modelFirstWord)
 }
 
 /**
