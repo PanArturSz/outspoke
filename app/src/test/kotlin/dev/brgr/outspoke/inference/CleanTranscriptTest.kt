@@ -420,6 +420,76 @@ class CleanTranscriptTest {
             .isEqualTo("she ran.")
     }
 
+    // ── Step 3 — lowercase the word following a removed spurious period ───────────────
+    //
+    // Parakeet capitalises the first word after every period (including prosodic-pause
+    // periods that [filterSpuriousPeriods] then removes). Without the fix, removing the
+    // period strands the capital mid-sentence ("…Otherwise. The encoder…" → "…Otherwise The
+    // encoder…"). The fix lowercases the following word's first letter, with guards for
+    // acronyms and the English pronoun "I"/its contractions, and is skipped for languages
+    // that capitalise nouns mid-sentence (German) so legitimate noun capitals are preserved.
+
+    @Test
+    fun `filterSpuriousPeriods lowercases capitalised word after a removed period (English)`() {
+        // "Otherwise." is a short 1-word segment → period removed; "The" was capitalised by
+        // the model → must be lowercased to "the".
+        assertThat("Otherwise. The encoder receives".filterSpuriousPeriods())
+            .isEqualTo("Otherwise the encoder receives")
+    }
+
+    @Test
+    fun `filterSpuriousPeriods lowercases a run of capitalised words after consecutive removed periods`() {
+        // Each period is a short segment → removed; each following word was capitalised by
+        // the model → all must be lowercased. Kept under the 5-word segment threshold so
+        // every period is removed (the counter does not reset on removal, so a 5th word's
+        // period would be kept — see the separate threshold tests).
+        assertThat("will. Silently. Produce. for the result".filterSpuriousPeriods())
+            .isEqualTo("will silently produce for the result")
+    }
+
+    @Test
+    fun `filterSpuriousPeriods keeps acronym after a removed period`() {
+        // "NASA" is all-caps (≥2 letters) → kept even though the preceding period was removed.
+        assertThat("short. NASA launched".filterSpuriousPeriods())
+            .isEqualTo("short NASA launched")
+    }
+
+    @Test
+    fun `filterSpuriousPeriods keeps English pronoun I and contractions after a removed period`() {
+        // "I" (length 1) and "I'm" / "I'll" (I + apostrophe) stay capitalised.
+        assertThat("pause. I went".filterSpuriousPeriods())
+            .isEqualTo("pause I went")
+        assertThat("pause. I'm going".filterSpuriousPeriods())
+            .isEqualTo("pause I'm going")
+        assertThat("pause. I'll go".filterSpuriousPeriods())
+            .isEqualTo("pause I'll go")
+    }
+
+    @Test
+    fun `filterSpuriousPeriods does not lowercase after a KEPT period (real sentence boundary)`() {
+        // 5-word segment → period kept (real boundary) → following word stays capitalised.
+        assertThat("one two three four five. Next sentence".filterSpuriousPeriods())
+            .isEqualTo("one two three four five. Next sentence")
+    }
+
+    @Test
+    fun `filterSpuriousPeriods skips lowercase-fix for German to preserve noun capitalisation`() {
+        // German nouns are always capitalised; after a removed spurious period the following
+        // word may be a legitimately capitalised noun ("Haus") → must NOT be lowercased.
+        // "kurz." is a 1-word short segment → period removed, but "Haus" stays capitalised.
+        assertThat("kurz. Haus ist hier".filterSpuriousPeriods(language = "de"))
+            .isEqualTo("kurz Haus ist hier")
+    }
+
+    @Test
+    fun `cleanTranscript repairs stranded capitals from removed prosodic-pause periods end to end`() {
+        // End-to-end: the model capitalised the word after each prosodic-pause period, then
+        // [filterSpuriousPeriods] removes those periods (short segments) and lowercases the
+        // stranded capitals. applySentenceCapitalization then caps only the first letter.
+        val cleaned = "will. Silently. Produce. for the result".cleanTranscript()
+        assertThat(cleaned).isEqualTo("Will silently produce for the result")
+    }
+
     // ── Track D.2 — Capitalisation guard on non-sentence-final words ────────────────
 
     @Test
@@ -437,9 +507,19 @@ class CleanTranscriptTest {
     }
 
     @Test
-    fun `applySentenceCapitalization capitalises first word of utterance unconditionally even if in guard set`() {
-        // "the" at utterance start must still be capitalised (isFirstCapitalize = true)
+    fun `applySentenceCapitalization respects model lowercase for guard-set word at utterance start`() {
+        // Bug 2 fix: "the" is in SHOULD_STAY_LOWERCASE and the model emitted it lowercase.
+        // This is the model's signal that it does NOT consider this a sentence start
+        // (drifted continuation), so we must NOT capitalise it.  A genuine utterance
+        // start would have come out of Parakeet already capitalised ("The").
         assertThat("the quick brown fox.".applySentenceCapitalization())
+            .isEqualTo("the quick brown fox.")
+    }
+
+    @Test
+    fun `applySentenceCapitalization capitalises first word when model already uppercased it`() {
+        // When the model itself emits "The" (uppercase), it IS a sentence start → keep.
+        assertThat("The quick brown fox.".applySentenceCapitalization())
             .isEqualTo("The quick brown fox.")
     }
 

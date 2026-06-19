@@ -70,6 +70,21 @@ class KeyboardViewModel(
         .stateIn(viewModelScope, SharingStarted.Eagerly, "auto")
 
     /**
+     * The post-processing language used by the cleaning pipeline (filler removal, number
+     * normalisation, spurious-period handling). Mirrors [SpeechEngine.currentLanguage] for
+     * the active engine: the user's forced language, or `"en"` when set to `"auto"` / unset.
+     *
+     * Collected eagerly so [dev.brgr.outspoke.ime.TextInjector]'s display-cleaning lambda can
+     * read a synchronous snapshot when injecting text — this keeps the display path's
+     * language consistent with the engine's (e.g. so German noun capitalisation is
+     * preserved and German fillers are removed in the displayed text, not just in the
+     * stable-chunk tracking path).
+     */
+    val currentLanguage: StateFlow<String> = appPreferences.forcedLanguage
+        .map { it ?: "en" }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, "en")
+
+    /**
      * `true` when the transcript post-processing pipeline (filler removal, stutter collapse,
      * repetition deduplication, capitalisation) is active.  Defaults to `true`.
      * Collected eagerly so the live value is always available when recording starts.
@@ -323,14 +338,24 @@ class KeyboardViewModel(
     /**
      * Called when the user taps "Retry" after a transient error (e.g. low-confidence failure).
      *
-     * Starts a new recording session and immediately engages continuous mode so the stop
-     * button is shown. Without this, the button would appear magenta (active) in HOLD mode
-     * with no way to stop — the gesture handler is not tracking a held finger, so the user
-     * would have to tap the TalkButton which would re-start instead of stop recording.
+     * Clears the error and returns to [KeyboardUiState.Idle] so the user starts a fresh
+     * recording with a normal press (HOLD) or a drag-up-to-lock — exactly like the initial
+     * recording.
+     *
+     * We intentionally do NOT auto-start recording and do NOT engage continuous mode. The
+     * previous behaviour forced continuous mode and immediately started capturing, which
+     * made the button jump straight into locked recording with no finger on it — confusing
+     * and not what "retry" implies. "Retry" means "let me try again", i.e. dismiss the
+     * error and give me back the idle button; the user then chooses how to record.
      */
     fun onRetry() {
-        _isContinuousMode.value = true
-        onRecordStart()
+        // Cancel any lingering capture / inference from the failed session so it cannot
+        // bleed into the next one, then return to Idle.
+        captureJob?.cancel()
+        captureJob = null
+        audioCaptureManager.stopCapture()
+        _isContinuousMode.value = false
+        _uiState.value = KeyboardUiState.Idle
     }
 
     /** Delete the character immediately before the cursor. */

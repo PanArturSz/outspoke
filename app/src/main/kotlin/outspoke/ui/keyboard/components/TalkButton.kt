@@ -176,28 +176,44 @@ fun TalkButton(
                                     var locked = false
                                     val startY = down.position.y
 
-                                    while (true) {
-                                        val event = awaitPointerEvent()
-                                        val change = event.changes.firstOrNull() ?: break
+                                    // try/finally guarantees recording stops when the gesture ends
+                                    // for ANY reason — not only an explicit finger-up. A lost
+                                    // up event otherwise leaves the handler stuck in
+                                    // awaitPointerEvent() with recording still active and the
+                                    // button showing "listening", forcing the user to tap again
+                                    // to stop. Lost up events happen in the IME context when the
+                                    // host app scrolls/relayouts after a mid-session commit
+                                    // (InputConnection.commitText can interrupt the IME touch
+                                    // stream with an empty/cancelled pointer event), or when the
+                                    // keyboard view is recreated/cancelled mid-hold. The previous
+                                    // code broke out of the loop on `event.changes.firstOrNull()
+                                    // == null` and on coroutine cancellation WITHOUT calling
+                                    // onRecordStop — both leaked an active recording.
+                                    try {
+                                        while (true) {
+                                            val event = awaitPointerEvent()
+                                            val change = event.changes.firstOrNull()
+                                            if (change == null) break  // empty/cancelled event → release
+                                            if (!change.pressed) break  // finger up → release
 
-                                        if (!change.pressed) {
-                                            // Released - stop only if not locked
-                                            dragProgress = 0f
-                                            isHolding = false
-                                            if (!locked) currentOnRecordStop()
-                                            break
+                                            change.consume()
+                                            val upDelta = startY - change.position.y
+                                            dragProgress = (upDelta / thresholdPx).coerceIn(0f, 1f)
+
+                                            if (!locked && upDelta > thresholdPx) {
+                                                locked = true
+                                                dragProgress = 0f
+                                                isHolding = false
+                                                currentOnContinuousMode()
+                                            }
                                         }
-
-                                        change.consume()
-                                        val upDelta = startY - change.position.y
-                                        dragProgress = (upDelta / thresholdPx).coerceIn(0f, 1f)
-
-                                        if (!locked && upDelta > thresholdPx) {
-                                            locked = true
-                                            dragProgress = 0f
-                                            isHolding = false
-                                            currentOnContinuousMode()
-                                        }
+                                    } finally {
+                                        // Locked (continuous) mode is excluded: the user explicitly
+                                        // engaged continuous recording, which is stopped via the
+                                        // tap-to-stop path above, not by gesture exit.
+                                        dragProgress = 0f
+                                        isHolding = false
+                                        if (!locked) currentOnRecordStop()
                                     }
                                 }
                             }

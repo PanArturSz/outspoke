@@ -15,6 +15,14 @@ import java.nio.LongBuffer
 private const val TAG = "ParakeetEngine"
 private const val FALLBACK_BLANK_ID = 1024
 
+/**
+ * Output of [ParakeetEngine.greedyDecode]: the decoded text plus a per-token geometric-mean
+ * confidence in [0.0, 1.0]. The confidence is exp(mean(log_softmax(argmax))) over all
+ * non-blank emissions — a principled score that low-values hallucinations (flat / uncertain
+ * token distributions on cold strides or noise) and high-values clean speech.
+ */
+private data class DecodeResult(val text: String, val confidence: Float)
+
 private object Names {
     // nemo128.onnx  ← verified: expected [waveforms, waveforms_lens]
     const val PREP_IN_AUDIO = "waveforms"
@@ -197,10 +205,10 @@ class ParakeetEngine : SpeechEngine {
             feats.close()
 
             // 4. Greedy TDT decode
-            val text = greedyDecode(e, dec, encOut, encLen)
+            val decode = greedyDecode(e, dec, encOut, encLen)
             encOut.close()
 
-            if (text.isBlank()) TranscriptResult.Partial("") else TranscriptResult.Final(text)
+            if (decode.text.isBlank()) TranscriptResult.Partial("") else TranscriptResult.Final(decode.text, confidence = decode.confidence)
         } catch (ex: Exception) {
             Log.e(TAG, "transcribe() failed", ex)
             TranscriptResult.Failure(ex)
@@ -319,7 +327,7 @@ class ParakeetEngine : SpeechEngine {
         session: OrtSession,
         encoderOut: OnnxTensor,
         encodedLength: Int,
-    ): String {
+    ): DecodeResult {
         // Encoder layout: [1, D, T]
         val encShape = encoderOut.info.shape
         val encDim = encShape[1].toInt()   // D = 1024
@@ -337,6 +345,15 @@ class ParakeetEngine : SpeechEngine {
         val decOutputNames = session.outputNames.toList()
 
         val hypothesis = mutableListOf<Int>()
+        // Per-token log-softmax accumulators for confidence scoring. Softmax is computed
+        // over the token portion [0..blankId]; log(softmax[argmax]) is accumulated for every
+        // non-blank emission. The geometric-mean probability exp(mean(logProbs)) is a
+        // principled 0.0–1.0 confidence that low-values hallucinations (the model emitting
+        // tokens with flat / uncertain distributions on cold strides or noise) while
+        // high-valuing clean speech. Used by InferenceRepository to suppress low-confidence
+        // first-stride outputs that would otherwise displace real content.
+        var logProbSum = 0.0
+        var nonBlankEmissions = 0
         // Predictor embedding range is [0, blankId), so initialise with 0 (SOS).
         // blankId is a *joint output label* only - never fed into the embedding layer.
         var prevToken = 0
@@ -384,6 +401,21 @@ class ParakeetEngine : SpeechEngine {
 
                     // Token: argmax over [0..blankId] (inclusive)
                     val predictedToken = (0..blankId).maxByOrNull { logits[it] } ?: blankId
+
+                    // Per-token confidence: log(softmax(predictedToken)) over the token
+                    // portion [0..blankId]. Computed for non-blank emissions only.
+                    if (predictedToken != blankId) {
+                        val tokenLogits = logits
+                        val maxLogit = (0..blankId).maxOf { tokenLogits[it] }
+                        var expSum = 0.0
+                        for (k in 0..blankId) {
+                            expSum += Math.exp((tokenLogits[k] - maxLogit).toDouble())
+                        }
+                        val logSoftmaxArgmax = (tokenLogits[predictedToken] - maxLogit).toDouble() -
+                                Math.log(expSum)
+                        logProbSum += logSoftmaxArgmax
+                        nonBlankEmissions++
+                    }
 
                     // Duration: argmax over the last numDurations logits.
                     // Snapshot to a local val so the compiler's flow analysis can prove
@@ -439,7 +471,11 @@ class ParakeetEngine : SpeechEngine {
         }
 
         val finalText = detokenize(hypothesis)
-        return finalText
+        val confidence = if (nonBlankEmissions > 0) {
+            // Geometric mean of per-token probabilities: exp(mean(logProbs)).
+            Math.exp(logProbSum / nonBlankEmissions).toFloat().coerceIn(0f, 1f)
+        } else 1.0f
+        return DecodeResult(finalText, confidence)
     }
 
     /**

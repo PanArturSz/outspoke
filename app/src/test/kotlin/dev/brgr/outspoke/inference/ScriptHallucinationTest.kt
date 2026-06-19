@@ -70,7 +70,7 @@ class ScriptHallucinationTest {
 
     @Test
     fun `Latin Extended-B character passes`() {
-        // U+024F (ɏ) is the last code point of Latin Extended-B — must be allowed
+        // U+024F (ɏ) is the last code point of Latin Extended-B - must be allowed
         val text = "lati\u024F"
         assertThat(isScriptHallucination(text)).isFalse()
     }
@@ -95,7 +95,7 @@ class ScriptHallucinationTest {
 
     @Test
     fun `punctuation and digits are neutral and do not count toward total`() {
-        // All characters are punctuation or digits — total == 0 → no hallucination
+        // All characters are punctuation or digits - total == 0 → no hallucination
         val text = "1234 5678 !@#$%^&*()"
         assertThat(isScriptHallucination(text)).isFalse()
     }
@@ -116,8 +116,69 @@ class ScriptHallucinationTest {
     @Test
     fun `allowed typographic punctuation does not skew ratio`() {
         // Euro, German quotes etc. should be neutral
-        // \u201E = „ (double low-9 quotation mark), \u201C = " (left double quotation mark)
+        // \u201E = „ (double low-9 quotation mark), \u201C = “ (left double quotation mark)
         val text = "Preis: \u20AC100 \u201Egut\u201C \u00ABsehr gut\u00BB"
         assertThat(isScriptHallucination(text)).isFalse()
+    }
+}
+
+/**
+ * Unit tests for [stripScriptHallucinations] — the soft counterpart to
+ * [isScriptHallucination] introduced for E3.
+ */
+class StripScriptHallucinationTest {
+
+    @Test
+    fun `pure Latin text is returned unchanged`() {
+        assertThat(stripScriptHallucinations("Hello world")).isEqualTo("Hello world")
+    }
+
+    @Test
+    fun `Cyrillic and Greek are preserved`() {
+        assertThat(stripScriptHallucinations("Привет Γεια"))?.isEqualTo("Привет Γεια")
+    }
+
+    @Test
+    fun `single CJK artefact is stripped and Latin words preserved`() {
+        // Cold-first-stride pattern: one spurious CJK token alongside the real words.
+        val text = "你 Hello world"
+        assertThat(stripScriptHallucinations(text)).isEqualTo("Hello world")
+    }
+
+    @Test
+    fun `embedded symbol between words is dropped and surrounding words kept`() {
+        val text = "hello ★ world"
+        // The ★ is removed; the two surrounding spaces collapse to a double space (not
+        // re-normalised here — that is the job of the downstream cleaning pipeline).
+        assertThat(stripScriptHallucinations(text)).isEqualTo("hello  world")
+    }
+
+    @Test
+    fun `entirely non-script text returns null`() {
+        assertThat(stripScriptHallucinations("你世界")).isNull()
+        assertThat(stripScriptHallucinations("★☆♫")).isNull()
+    }
+
+    @Test
+    fun `blank or empty input returns null`() {
+        assertThat(stripScriptHallucinations("")).isNull()
+        assertThat(stripScriptHallucinations("   ")).isNull()
+    }
+
+    @Test
+    fun `punctuation and whitespace are preserved when letters remain`() {
+        val text = "Hello, world!"
+        assertThat(stripScriptHallucinations(text)).isEqualTo("Hello, world!")
+    }
+
+    @Test
+    fun `punctuation-only text with no letters returns null`() {
+        assertThat(stripScriptHallucinations("!@# .,?")).isNull()
+    }
+
+    @Test
+    fun `German umlauts are preserved`() {
+        val text = "Das ist schön"
+        assertThat(stripScriptHallucinations(text)).isEqualTo("Das ist schön")
     }
 }

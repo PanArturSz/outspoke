@@ -269,19 +269,24 @@ class TextInjectorTest {
 
     /**
      * When the model output at [TextInjector.commitFinal] time completely diverges from
-     * anything previously committed, the injector must not erase existing field content.
+     * anything previously committed, the injector must not erase existing field content
+     * AND must not silently discard the final.
      *
-     * Recovery layer 2 preserves the composing span via `finishComposingText()` so that at
-     * minimum what the user last saw in the UI preview remains in the field.
+     * With nothing permanently frozen (savedCommitted empty) and an unrelated final, the
+     * composing-anchor falls through and the final is committed in place of the stale
+     * composing span — the final is the source of truth, so it wins. The field ends up
+     * non-empty and containing the final text.
      */
     @Test
-    fun `commitFinal after total alignment failure preserves composing span`() {
+    fun `commitFinal after total alignment failure keeps field non-empty and final present`() {
         injector.setPartial("Text der angezeigt wurde.")
         // Simulate complete divergence in commitFinal:
         injector.commitFinal("Völlig anderer Text.")
 
-        // Whatever recovery path was taken, the field must not be empty.
+        // The field must not be empty and must contain the (unrelated) final text, which
+        // wins over the stale partial rather than being discarded.
         assertThat(ic.fieldText.trim()).isNotEmpty()
+        assertThat(ic.fieldText).contains("Völlig anderer Text.")
     }
 
     /**
@@ -387,6 +392,142 @@ class TextInjectorTest {
         assertThat(text).contains("go. Now")
         // The junction must appear exactly once - no doubled separator.
         assertThat(text.indexOf("go. Now")).isEqualTo(text.lastIndexOf("go. Now"))
+    }
+
+    // ── E5-Final: commitFinal must not overwrite a correct composing span ──────────
+    //
+    // Regression for the dominant first-word-loss bug found in the 2026-06-19 log
+    // measurement. The streaming partial captured the words correctly
+    // ("Now I lifted the record button."), the final pass on a window with trailing
+    // VAD-hangover silence truncated them ("The record button."), and commitFinal then
+    // OVERWROTE the correct composing span with the truncated final.
+    //
+    // Root cause: when nothing is permanently frozen (committedWords empty) but a
+    // composing span is showing, findNewContent([], final) returns ALL of final, the
+    // `remaining.isNotEmpty()` branch fires, and commitText(final) replaces the span.
+    // The composing-anchor logic that would have prevented this lived in a `when` branch
+    // that was unreachable whenever committedWords was empty.
+
+    /**
+     * Case (a): the final is a suffix/subset of the composing span (the truncated-final
+     * failure). The composing span must be preserved; the truncated final must be
+     * discarded rather than overwrite it.
+     */
+    @Test
+    fun `commitFinal does not overwrite composing span when final is a truncated subset (E5-Final case a)`() {
+        // Streaming partial showed the full correct sentence (nothing frozen: ≤6 words).
+        injector.setPartial("Now I lifted the record button.")
+        assertThat(ic.fieldText)
+            .describedAs("Pre-condition: full composing span visible before final")
+            .contains("Now I lifted the record button.")
+
+        // Final pass on a window with trailing silence truncated the leading words.
+        injector.commitFinal("The record button.")
+
+        // The correct composing span must survive; the truncated final must NOT overwrite it.
+        assertThat(ic.fieldText.trim())
+            .describedAs("Correct composing span must be preserved, truncated final discarded")
+            .isEqualTo("Now I lifted the record button.")
+    }
+
+    /**
+     * Case where the final genuinely extends the composing span by additional words.
+     * The injector must commit composing + the genuinely new words (the only case where
+     * the final is allowed to drive an overwrite of the span — and only to ADD words).
+     */
+    @Test
+    fun `commitFinal extends composing span when final adds words beyond it (E5-Final extend)`() {
+        // Partial showed a 5-word sentence (nothing frozen).
+        injector.setPartial("Ich habe heute einen guten Tag.")
+        assertThat(ic.fieldText).contains("Ich habe heute einen guten Tag.")
+
+        // Final extends the sentence by two more words.
+        injector.commitFinal("Ich habe heute einen guten Tag. Und Sonne.")
+
+        assertThat(ic.fieldText.trim())
+            .describedAs("Composing span + genuinely new final words must all be present")
+            .isEqualTo("Ich habe heute einen guten Tag. Und Sonne.")
+    }
+
+    /**
+     * Case (b): the final is completely unrelated to the composing span (e.g. a severe
+     * model rewrite). The composing-anchor must NOT force-keep the old span; instead the
+     // injector falls through to the field-recovery path so the final can be reconciled
+     * against the actual field content. The field must end up non-empty and coherent.
+     */
+    @Test
+    fun `commitFinal falls through to field recovery when final is unrelated to composing (E5-Final case b)`() {
+        injector.setPartial("Erste Idee die ich hatte.")
+        assertThat(ic.fieldText).contains("Erste Idee die ich hatte.")
+
+        // Completely unrelated final - composing-anchor cannot keep the old span, must fall
+        // through to field-content recovery.
+        injector.commitFinal("Ganz anderer Text ohne Verbindung.")
+
+        // Field must not be empty and must end up containing the final content via recovery.
+        val text = ic.fieldText.trim()
+        assertThat(text).isNotEmpty()
+        assertThat(text).contains("Ganz anderer Text ohne Verbindung.")
+    }
+
+    // ── Long-dictation word-loss recovery (2026-06-19 field-dump regression) ──────────
+    //
+    // These cover the two new recovery layers in commitFinal's complete-alignment-failure
+    // path. The previous behaviour preserved the (possibly garbled) composing span and
+    // DISCARDED the final, silently losing the final's words on long dictation when the
+    // field's tail was stale (a partial the model later corrected). The fix: interior-scan
+    // the field for the final's head (append only the new tail), and as a last resort
+    // append the full final rather than lose words.
+
+    /**
+     * Recovery layer 3 (interior scan): the final's head appears as a contiguous run
+     * somewhere in the field interior, but the field's TAIL is a stale word not in the
+     * final (so the suffix fallback cannot anchor). Only the final's genuinely-new tail
+     * beyond the interior match must be appended — no word loss, the existing field
+     // content preserved. A stray stale seam word may remain (acceptable; deletable).
+     */
+    @Test
+    fun `commitFinal interior-scan appends only new tail when final head is in field interior (long-dictation regression)`() {
+        // Build committed prefix + a composing span whose tail ends in a stale word ("STALE"),
+        // mimicking a partial the model later corrects on the final pass.
+        //   committed = [a, b, c], composing = [d, e, f, g, h, STALE]
+        //   field     = "a b c d e f g h STALE"
+        injector.setPartial("a b c d e f g h")            // freezes a, b; composing = c..h
+        injector.setPartial("a b c d e f g h STALE")      // freezes c; composing = d..h, STALE
+        assertThat(ic.fieldText).contains("STALE")
+
+        // Final's head "c d e f g h" is present in the field interior; the field's tail
+        // "STALE" is not in the final, so suffix-based alignment fails and the interior
+        // scan must anchor on "c d e f g h".
+        injector.commitFinal("c d e f g h NEW TAIL HERE")
+
+        val text = ic.fieldText
+        // The genuinely-new tail must be appended (no word loss).
+        assertThat(text).contains("NEW TAIL HERE")
+        // The interior-overlap content must still be present (not erased).
+        assertThat(text).contains("c d e f g h")
+    }
+
+    /**
+     * Recovery layer 4 (last resort): the final is completely unalignable to anything in
+        // the field (no shared words at all). The injector must APPEND the full final rather
+        // than discard it, so no transcribed words are ever silently lost. Existing field
+        // content is preserved; minor duplication at the seam is acceptable and visible.
+     */
+    @Test
+    fun `commitFinal appends full final on total alignment failure instead of discarding it (long-dictation regression)`() {
+        // Build up committed + composing content.
+        injector.setPartial("alpha beta gamma delta epsilon zeta eta theta")
+        assertThat(ic.fieldText).contains("alpha beta")
+
+        // Completely unrelated final with no shared words.
+        injector.commitFinal("zulu yankee xray whiskey")
+
+        val text = ic.fieldText
+        // The full final must be present (no word loss) — appended, not discarded.
+        assertThat(text).contains("zulu yankee xray whiskey")
+        // Existing field content must still be present (not erased).
+        assertThat(text).contains("alpha beta gamma delta epsilon zeta eta theta")
     }
 }
 

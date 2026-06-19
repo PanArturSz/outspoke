@@ -348,7 +348,45 @@ private val NON_SENTENCE_CLOSING_WORDS = setOf(
  * Must run **before** [applySentenceCapitalization] so that removing spurious periods
  * prevents false capitalisation of the words that follow them.
  */
-internal fun String.filterSpuriousPeriods(): String {
+/**
+ * Returns [word] with its first letter lower-cased, unless it is a token that must stay
+ * capitalised mid-sentence in a Latin-script language that does not capitalise nouns
+ * (e.g. English): the pronoun "I" and its contractions ("I'm", "I'll", …), and all-caps
+ * acronyms (≥2 letters, e.g. "NASA", "IBM").
+ *
+ * Used by [filterSpuriousPeriods] to undo the model's sentence-start capitalisation of the
+ * word that followed a spurious period which has just been removed — without this, removing
+ * the period strands the capital mid-sentence (e.g. "…Otherwise. The encoder…" → removing
+ * the period yields "…Otherwise The encoder…" with a stray capital "The").
+ *
+ * Conservative guards so it never touches legitimate capitalisation:
+ *  - Lone characters (length < 2) are left alone (covers standalone "I", "A", initials).
+ *  - All-uppercase words (acronyms) are kept.
+ *  - Words beginning with "I" + apostrophe (English pronoun contractions) are kept.
+ *  - Already-lowercase / digit / punctuation starts are returned unchanged.
+ */
+private fun lowercaseFirstIfMidSentence(word: String): String {
+    if (word.length < 2) return word
+    val first = word[0]
+    if (!first.isUpperCase()) return word
+    // Acronym: every letter is uppercase (≥2 letters) → keep.
+    val letters = word.filter { it.isLetter() }
+    if (letters.length >= 2 && letters.all { it.isUpperCase() }) return word
+    // English pronoun contraction: "I'm", "I'll", "I'd", "I've", … → keep.
+    if (first == 'I' && (word[1] == '\'' || word[1] == '\u2019')) return word
+    return first.lowercaseChar() + word.substring(1)
+}
+
+/**
+ * Languages whose orthography capitalises nouns mid-sentence. For these, the
+ * [filterSpuriousPeriods] lowercase-fix is SKIPPED: a capitalised word following a removed
+ * spurious period may be a correctly-capitalised noun, and lowercasing it would introduce a
+ * real spelling error. Stranded capitals on non-nouns are a minor cosmetic issue and the
+ * lesser evil.
+ */
+private val LANGUAGES_WITH_NOUN_CAPITALISATION = setOf("de")
+
+internal fun String.filterSpuriousPeriods(language: String = "en"): String {
     if (!contains('.')) return this
 
     // Split into tokens, preserving whitespace attachment by splitting on spaces.
@@ -358,9 +396,31 @@ internal fun String.filterSpuriousPeriods(): String {
     val result = mutableListOf<String>()
     // Words accumulated since the start of the utterance or since the last kept period.
     var wordCountSinceLastPeriod = 0
+    // Whether the next non-period-bearing word's first letter should be lower-cased because
+    // the immediately preceding spurious period was removed (Step 3). Only applies to
+    // languages that do not capitalise nouns mid-sentence; for German the model's
+    // capitalisation may be a legitimately capitalised noun, so the fix is skipped.
+    val lowerCaseFixEnabled = language.substringBefore('-').lowercase() !in LANGUAGES_WITH_NOUN_CAPITALISATION
+    var lowercaseNextFirstLetter = false
 
     for (i in words.indices) {
-        val word = words[i]
+        var word = words[i]
+        // Step 3: if the immediately preceding spurious period was removed, undo the
+        // model's sentence-start capitalisation on THIS word (whatever it is — plain word,
+        // or a period-bearing word whose own period may also be removed next). Apply at
+        // the top of the loop so every emit path sees the de-capitalised form. Acronyms
+        // and the English pronoun "I"/its contractions are preserved by
+        // [lowercaseFirstIfMidSentence]; German is skipped entirely via
+        // [lowerCaseFixEnabled] because a capitalised word there may be a legitimate noun.
+        if (lowercaseNextFirstLetter && lowerCaseFixEnabled) {
+            val fixed = lowercaseFirstIfMidSentence(word)
+            if (fixed != word) {
+                Log.d(TAG, "[CLEAN:SPURIOUS_PERIOD] lower-cased \"$word\" → \"$fixed\" after removed period")
+                word = fixed
+            }
+        }
+        lowercaseNextFirstLetter = false
+
         // A word "carries" a period when it ends with exactly one period (not ellipsis).
         val hasPeriod = word.endsWith('.') && !word.endsWith("..")
         if (!hasPeriod) {
@@ -394,10 +454,18 @@ internal fun String.filterSpuriousPeriods(): String {
             // filtered by hasPeriod's !word.endsWith("..") check and normalised away
             // upstream) but is kept as a safety guard so we never emit an empty token.
             result.add(if (base.isEmpty()) word else base)
+            // Step 3: the spurious period we just removed was the model's signal for a
+            // sentence start, so the following word was capitalised by the model. Flag it
+            // for first-letter lower-casing at the top of the next iteration (subject to
+            // the acronym / pronoun guards in [lowercaseFirstIfMidSentence]) so removing
+            // the period does not strand the capital mid-sentence.
+            lowercaseNextFirstLetter = lowerCaseFixEnabled
             // Do NOT reset wordCountSinceLastPeriod — the removed period was not a real
             // sentence boundary, so counting continues from where it was.
             wordCountSinceLastPeriod = segmentWordCount
         } else {
+            // A kept period is a real sentence boundary — the following word stays
+            // capitalised (applySentenceCapitalization handles that), so do NOT flag it.
             result.add(word)
             // This period is a real sentence boundary: reset the word counter.
             wordCountSinceLastPeriod = 0
@@ -438,7 +506,23 @@ internal fun String.applySentenceCapitalization(skipInitialCapitalize: Boolean =
             // and skip capitalisation if it belongs to the lowercase guard set.
             val shouldGuard = capitalizeTriggeredByPeriod && !isFirstCapitalize &&
                     peekWord(text, i).lowercase() in SHOULD_STAY_LOWERCASE
-            if (shouldGuard) {
+            // Respect the model's own casing at the utterance start: Parakeet capitalises
+            // genuine sentence starts (every real utterance start in practice comes out of
+            // the model already capitalised). When the model emits the FIRST word of a
+            // partial in LOWERCASE and that word is a mid-sentence function word
+            // (article / preposition / conjunction), it is a drifted continuation (the
+            // model dropped the prefix), NOT a real sentence start — so do NOT capitalise
+            // it. This prevents stranded capitals like "…do it. To be able…" where the
+            // model emitted "to" lowercase but the previous partial's utterance-final
+            // period fooled the capitaliser into treating "to" as a new sentence.
+            //
+            // The lowercase check (c.isLowerCase()) is the key signal: a genuine utterance
+            // start arrives capitalised, so this guard never suppresses a real sentence
+            // start — only the drifted-continuation case the model itself flagged as
+            // non-sentence-initial by emitting it lowercase.
+            val shouldRespectModelLowercase = isFirstCapitalize && c.isLowerCase() &&
+                    peekWord(text, i).lowercase() in SHOULD_STAY_LOWERCASE
+            if (shouldGuard || shouldRespectModelLowercase) {
                 builder.append(c)
             } else {
                 builder.append(c.uppercaseChar())
@@ -578,7 +662,7 @@ internal fun String.cleanTranscript(
     val afterDedup = afterNumbers.collapseRepeatedPhrases()
     if (afterDedup != afterStutters) Log.d(TAG, "[CLEAN:PHRASES]     \"$afterStutters\" → \"$afterDedup\"")
 
-    val afterSpuriousPeriods = afterDedup.filterSpuriousPeriods()
+    val afterSpuriousPeriods = afterDedup.filterSpuriousPeriods(language)
     if (afterSpuriousPeriods != afterDedup) Log.d(
         TAG,
         "[CLEAN:SPURIOUS_P]  \"$afterDedup\" → \"$afterSpuriousPeriods\""
@@ -802,6 +886,34 @@ internal fun zeroPadToMinimum(samples: ShortArray, minSamples: Int): ShortArray 
  * characters, lone digits, or implausible words produced on very short/silent clips) while
  * accepting a wide range of real one-word and short-phrase results.
  */
+
+/**
+ * Minimum per-token geometric-mean probability required to emit the *first* non-blank
+ * partial of a session (cold-stride confidence gate).
+ *
+ * On the first 1–2 strides (cold strides) Parakeet sometimes hallucinates words from
+ * ambient noise or room tone.  These cold hallucinations are characterised by low per-token
+ * softmax probabilities (the model is uncertain), whereas real speech — even on the first
+ * stride — produces confidently peaked distributions.
+ *
+ * When the first non-blank partial has a confidence below this threshold it is suppressed
+ * (treated as a blank stride).  The audio stays in the window, so the next stride
+ * re-transcribes the same audio with +1 s of context.  If the output was a real word it
+ * will reappear with higher confidence and be emitted normally.  If it was a hallucination
+ * it will not reappear — or will again be suppressed until a high-confidence stride arrives.
+ *
+ * The gate is **removed** as soon as any one partial passes it (`hasCommittedAnyPartial =
+ * true`), so mid-dictation partials are never gated regardless of confidence.
+ *
+ * Starting threshold: 0.40 (geometric mean ≥ 40 %).  Empirical; can be tuned.
+ */
+internal const val COLD_STRIDE_CONFIDENCE_THRESHOLD = 0.40f
+
+/** Maximum number of consecutive low-confidence cold strides before giving up and
+ * emitting anyway, to prevent the gate from permanently silencing a user who whispers
+ * or speaks in a very noisy environment.  After this many suppressed strides the next
+ * partial is emitted unconditionally regardless of confidence. */
+internal const val COLD_STRIDE_MAX_SUPPRESSED = 4
 internal const val CONFIDENCE_THRESHOLD = 0.55f
 
 /**
@@ -910,6 +1022,46 @@ internal fun isScriptHallucination(text: String, language: String = "en"): Boole
 }
 
 /**
+ * Soft counterpart to [isScriptHallucination]: instead of discarding an entire transcript
+ * because a single warm-up artefact token landed outside the allowed script ranges, this
+ * removes only the offending characters and keeps the legitimate Latin / Cyrillic / Greek
+ * content.
+ *
+ * This matters most on the **cold first stride**, where Parakeet's TDT decoder
+ * occasionally emits one spurious CJK / symbol token alongside the real first words.
+ * The old behaviour called [isScriptHallucination] on the whole partial and, on a hit,
+ * replaced it with [TranscriptResult.Failure] — aborting the recording and losing the
+ * first words even though most of the partial was correct. Stripping preserves the real
+ * words so the user sees them and the sliding window can continue.
+ *
+ * Whitespace and [ALLOWED_PUNCTUATION] are always preserved. Letters/digits inside the
+ * allowed ranges are preserved; everything else (out-of-range letters/digits, symbols,
+ * emoji) is dropped.
+ *
+ * @return the stripped string, or `null` when nothing alphanumeric survives — meaning the
+ *   input was effectively entirely a hallucination and the caller should treat it as a
+ *   failure (for finals) or a blank stride (for partials) rather than emitting empty text.
+ */
+internal fun stripScriptHallucinations(text: String, language: String = "en"): String? {
+    if (text.isBlank()) return null
+    val sb = StringBuilder(text.length)
+    for (ch in text) {
+        if (ch.isWhitespace()) { sb.append(ch); continue }
+        if (ch in ALLOWED_PUNCTUATION) { sb.append(ch); continue }
+        if (ch.isLetterOrDigit()) {
+            val known = ch in LATIN_RANGE || ch in CYRILLIC_RANGE ||
+                    ch in GREEK_RANGE_1 || ch in GREEK_RANGE_2
+            if (known) sb.append(ch)
+            // else: out-of-range letter/digit (e.g. CJK) — drop
+            continue
+        }
+        // Non-letter, non-digit, non-whitespace, non-punctuation (symbols, emoji) — drop
+    }
+    val result = sb.toString().trim()
+    return if (result.none { it.isLetterOrDigit() }) null else result
+}
+
+/**
  * Bridges the audio capture pipeline to any [SpeechEngine] with a sliding-window
  * strategy that keeps the window from growing long enough to cause Parakeet attention
  * drift.
@@ -1005,6 +1157,13 @@ class InferenceRepository(
         // allowing a natural stable-chunk trim to fire.  Reset to baseline on every trim.
         var dynamicStrideSamples = STRIDE_SAMPLES
 
+        // Cold-stride confidence gate: track whether we have ever emitted a partial in
+        // this session and how many consecutive low-confidence cold strides have been
+        // suppressed so far.  Reset at every silence-boundary utterance boundary so each
+        // utterance within a continuous session gets its own cold-stride gate.
+        var hasCommittedAnyPartial = false
+        var coldStridesSuppressed = 0
+
         fun buildChunk(): AudioChunk {
             val merged = ShortArray(windowSamples)
             var pos = 0
@@ -1063,13 +1222,21 @@ class InferenceRepository(
                     }
                     Log.d(TAG, "[BOUNDARY] Final = ${cleaned.logLabel()}")
                     val cleanedText = (cleaned as? TranscriptResult.Final)?.text
+                    // E3: strip non-script artefacts from the final instead of discarding the
+                    // whole sentence. Only emit a Failure when nothing alphanumeric survives.
                     val toSend = if (cleanedText != null && isScriptHallucination(
                             cleanedText,
                             language = engine.currentLanguage
                         )
                     ) {
-                        Log.w(TAG, "[HALLUCINATION] Unexpected script detected in boundary final — suppressing")
-                        TranscriptResult.Failure(RuntimeException("Unexpected script detected — likely hallucination"))
+                        val stripped = stripScriptHallucinations(cleanedText, language = engine.currentLanguage)
+                        if (stripped != null) {
+                            Log.w(TAG, "[HALLUCINATION] stripped non-script chars from boundary final: \"$cleanedText\" → \"$stripped\"")
+                            applyGrammarCorrection(cleaned.copy(text = stripped), engine.currentLanguage)
+                        } else {
+                            Log.w(TAG, "[HALLUCINATION] boundary final entirely non-script after strip — suppressing")
+                            TranscriptResult.Failure(RuntimeException("Unexpected script detected — likely hallucination"))
+                        }
                     } else {
                         applyGrammarCorrection(cleaned, engine.currentLanguage)
                     }
@@ -1087,6 +1254,9 @@ class InferenceRepository(
                 isContinuationAfterTrim = false
                 consecutiveBlankStrides = 0
                 strideWaitLogged = false
+                // Reset cold-stride gate for the next utterance within this session.
+                hasCommittedAnyPartial = false
+                coldStridesSuppressed = 0
                 return@collect
             }
 
@@ -1146,18 +1316,43 @@ class InferenceRepository(
                     is TranscriptResult.Final -> result.text
                     else -> ""
                 }
-                val structuralText = if (postprocessingEnabled)
+                val structuralTextRaw = if (postprocessingEnabled)
                     rawText.cleanTranscriptStructural(isContinuation) else rawText
-                val fullCleanedText = if (postprocessingEnabled)
+                val fullCleanedTextRaw = if (postprocessingEnabled)
                     rawText.cleanTranscript(
                         isContinuation,
                         language = engine.currentLanguage,
                         formatNumbersAsDigits = formatNumbersAsDigits
                     ) else rawText
 
+                // E3: soft script-hallucination handling. Instead of discarding an entire
+                // partial when a single warm-up artefact token lands outside the
+                // Latin/Cyrillic/Greek ranges (common on the cold first stride), strip only
+                // the offending characters and keep the legitimate script content. If
+                // nothing alphanumeric survives the strip, the partial collapses to blank
+                // and is handled by the blank-stride branch below — never as a Failure,
+                // which would abort the whole recording on one bad token.
+                val hallucinated = isScriptHallucination(structuralTextRaw, language = engine.currentLanguage)
+                val structuralText = if (hallucinated)
+                    stripScriptHallucinations(structuralTextRaw, language = engine.currentLanguage) ?: ""
+                else structuralTextRaw
+                val fullCleanedText = if (hallucinated)
+                    stripScriptHallucinations(fullCleanedTextRaw, language = engine.currentLanguage) ?: ""
+                else fullCleanedTextRaw
+                if (hallucinated) {
+                    if (structuralText.isBlank()) {
+                        Log.w(TAG, "[HALLUCINATION] partial entirely non-script after strip — treating as blank: \"$structuralTextRaw\"")
+                    } else {
+                        Log.w(TAG, "[HALLUCINATION] stripped non-script chars from partial: \"$structuralTextRaw\" → \"$structuralText\"")
+                    }
+                }
+
                 val cleaned: TranscriptResult = when (result) {
                     is TranscriptResult.Partial -> result.copy(text = structuralText)
-                    is TranscriptResult.Final -> TranscriptResult.Partial(structuralText)
+                    // Engine returned Final for this audio window (Parakeet can do this);
+                    // treat as a streaming Partial and carry the confidence through so the
+                    // cold-stride gate still works correctly on such results.
+                    is TranscriptResult.Final -> TranscriptResult.Partial(structuralText, confidence = result.confidence)
                     else -> result
                 }
 
@@ -1202,10 +1397,58 @@ class InferenceRepository(
                     // A trim later in this same stride can re-arm it for the *next* stride.
                     isContinuationAfterTrim = false
 
-                    if (isScriptHallucination(cleaned.text, language = engine.currentLanguage)) {
-                        Log.w(TAG, "[HALLUCINATION] Unexpected script detected in partial — suppressing")
-                        send(TranscriptResult.Failure(RuntimeException("Unexpected script detected — likely hallucination")))
+                    // E3: hallucinated characters were already stripped above (and an
+                    // all-hallucination partial collapsed to blank, handled by the blank
+                    // branch). Emit the cleaned partial directly — no Failure, so a single
+                    // bad token can no longer abort the recording or nuke the first words.
+
+                    // ── Cold-stride confidence gate ───────────────────────────────────
+                    // On the very first non-blank partial of a session (or of an utterance
+                    // within a session), Parakeet sometimes emits a hallucination driven by
+                    // room tone / ambient noise.  These cold-stride hallucinations have
+                    // characteristically low per-token softmax probabilities.
+                    //
+                    // Gate: if no partial has been committed yet AND the engine-reported
+                    // confidence is below COLD_STRIDE_CONFIDENCE_THRESHOLD, suppress this
+                    // partial (treat it like a blank stride).  The audio is NOT discarded —
+                    // it stays in the window and will be re-transcribed on the next stride
+                    // with +1 s of additional context.  If the output was real speech the
+                    // next stride will confirm it with higher confidence.  If it was a
+                    // hallucination it will not reappear.
+                    //
+                    // Safety valve: after COLD_STRIDE_MAX_SUPPRESSED consecutive suppressed
+                    // cold strides we give up suppressing so a genuine low-energy whisper
+                    // or noisy environment doesn't permanently block output.
+                    val partialConfidence = (cleaned as? TranscriptResult.Partial)?.confidence ?: 1.0f
+                    val isColdStrideSuppressed = !hasCommittedAnyPartial &&
+                            coldStridesSuppressed < COLD_STRIDE_MAX_SUPPRESSED &&
+                            partialConfidence < COLD_STRIDE_CONFIDENCE_THRESHOLD
+                    if (isColdStrideSuppressed) {
+                        coldStridesSuppressed++
+                        Log.w(
+                            TAG,
+                            "[CONFIDENCE] cold-stride suppressed (confidence=%.2f < %.2f, streak=%d/%d): \"%s\""
+                                .format(
+                                    partialConfidence,
+                                    COLD_STRIDE_CONFIDENCE_THRESHOLD,
+                                    coldStridesSuppressed,
+                                    COLD_STRIDE_MAX_SUPPRESSED,
+                                    cleaned.text
+                                )
+                        )
+                        // Do NOT send.  Treat this stride as blank for consecutive-blank
+                        // counting so the silence-trim logic still fires if needed.
+                        consecutiveBlankStrides++
                     } else {
+                        if (!hasCommittedAnyPartial) {
+                            Log.d(
+                                TAG,
+                                "[CONFIDENCE] cold-stride passed (confidence=%.2f >= %.2f)"
+                                    .format(partialConfidence, COLD_STRIDE_CONFIDENCE_THRESHOLD)
+                            )
+                        }
+                        hasCommittedAnyPartial = true
+                        coldStridesSuppressed = 0
                         send(cleaned)
                     }
 
@@ -1441,10 +1684,18 @@ class InferenceRepository(
             }
 
             val finalText = (cleaned as? TranscriptResult.Final)?.text
+            // E3: strip non-script artefacts from the final instead of discarding the whole
+            // sentence. Only emit a Failure when nothing alphanumeric survives the strip.
             val finalToSend =
                 if (finalText != null && isScriptHallucination(finalText, language = engine.currentLanguage)) {
-                    Log.w(TAG, "[HALLUCINATION] Non-Latin script detected in final — suppressing")
-                    TranscriptResult.Failure(RuntimeException("Non-Latin script detected — likely hallucination"))
+                    val stripped = stripScriptHallucinations(finalText, language = engine.currentLanguage)
+                    if (stripped != null) {
+                        Log.w(TAG, "[HALLUCINATION] stripped non-script chars from final: \"$finalText\" → \"$stripped\"")
+                        applyGrammarCorrection(cleaned.copy(text = stripped), engine.currentLanguage)
+                    } else {
+                        Log.w(TAG, "[HALLUCINATION] final entirely non-script after strip — suppressing")
+                        TranscriptResult.Failure(RuntimeException("Non-Latin script detected — likely hallucination"))
+                    }
                 } else {
                     applyGrammarCorrection(cleaned, engine.currentLanguage)
                 }

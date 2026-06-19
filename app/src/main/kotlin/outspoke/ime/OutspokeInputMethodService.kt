@@ -510,7 +510,14 @@ class OutspokeInputMethodService :
             TextInjector(
                 connection,
                 attribute ?: EditorInfo(),
-                displayCleanFn = { text -> text.cleanTranscript() },
+                // Display-clean with the user's current language so the field gets the same
+                // language-aware cleaning the stable-chunk tracking path uses (filler
+                // removal, number normalisation, and spurious-period handling). Reading the
+                // StateFlow snapshot here is safe — currentLanguage is collected eagerly and
+                // always has a value.
+                displayCleanFn = { text ->
+                    text.cleanTranscript(language = keyboardViewModel.currentLanguage.value)
+                },
             )
         )
         Log.d(TAG, "onStartInput - engine: ${inferenceBinder?.getEngineState()?.value}")

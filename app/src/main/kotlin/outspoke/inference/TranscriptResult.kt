@@ -6,8 +6,15 @@ sealed class TranscriptResult {
     /**
      * In-progress transcript from streaming inference.
      * The keyboard should show [text] as composing (underlined) text.
+     *
+     * [confidence] is the engine's per-token geometric-mean probability in [0.0, 1.0]
+     * (1.0 when the engine does not surface per-token log-probs). Used by
+     * [dev.brgr.outspoke.inference.InferenceRepository] to suppress low-confidence
+     * first-stride outputs that would otherwise displace real speech (cold-stride
+     * hallucinations). Defaults to 1.0 so engines/tests that don't compute it are
+     * treated as fully confident.
      */
-    data class Partial(val text: String) : TranscriptResult()
+    data class Partial(val text: String, val confidence: Float = 1.0f) : TranscriptResult()
 
     /**
      * Final, confirmed transcript for a completed utterance.
@@ -17,10 +24,14 @@ sealed class TranscriptResult {
      * silence-boundary handler. The recording session is still active and the keyboard
      * must NOT tear down capture state — only commit the text and continue listening.
      * When false (the default), this is a true session-ending Final.
+     *
+     * [confidence] is the engine's per-token geometric-mean probability in [0.0, 1.0]
+     * (1.0 when not computed). See [Partial.confidence].
      */
     data class Final(
         val text: String,
         val isUtteranceBoundary: Boolean = false,
+        val confidence: Float = 1.0f,
     ) : TranscriptResult()
 
     /** Inference failed. [cause] carries the underlying exception for logging/display. */
