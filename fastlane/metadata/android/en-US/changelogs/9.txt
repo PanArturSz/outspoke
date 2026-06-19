@@ -1,0 +1,11 @@
+Seventh patch (v0.2.4).
+
+Reduced first-word hallucinations: a cold-stride confidence gate suppresses low-confidence Parakeet outputs on the first partial, so room-tone and ambient-noise artefacts are far less likely to appear as ghost words.
+
+Memory-pressure resilience: the keyboard now cooperatively unloads the ~700 MB ASR model when the OS signals low memory, and reloads it on the next keyboard open. This prevents OOM kills during app switches while keeping the model warm for brief interruptions.
+
+Holding the mic button is now more reliable: a missed or cancelled touch event no longer leaves the keyboard stuck in recording mode.
+
+Soft script-hallucination handling: a single stray character outside the Latin, Cyrillic, or Greek ranges no longer aborts the entire recording — only the offending character is stripped.
+
+Fixed sentence-boundary capitalisation of mid-sentence continuations to prevent stranded capitals like "...do it. To be able...".
