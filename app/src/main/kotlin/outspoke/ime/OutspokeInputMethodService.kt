@@ -30,17 +30,10 @@ import dev.brgr.outspoke.ui.keyboard.KeyboardScreen
 import dev.brgr.outspoke.ui.keyboard.KeyboardViewModel
 import dev.brgr.outspoke.ui.keyboard.components.SUGGESTION_BAR_HEIGHT_DP
 import dev.brgr.outspoke.ui.theme.OutspokeKeyboardTheme
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
 private const val TAG = "OutspokeIME"
-
-/**
- * How long (ms) the keyboard must stay hidden before the inference engine is unloaded
- * from RAM. Cancelled immediately if the keyboard reappears within this window.
- * 30 s is long enough to cover brief app-switches but short enough to reclaim model
- * memory (500 MB+) before the OS has to do it forcefully via an OOM kill.
- */
-private const val IDLE_UNLOAD_DELAY_MS = 30_000L
 
 /**
  * The core IME service. Implements [LifecycleOwner], [ViewModelStoreOwner], and
@@ -80,26 +73,29 @@ class OutspokeInputMethodService :
     /** True whenever [bindService] has been called and [unbindService] has not yet matched it. */
     private var isBound = false
 
-    /** Used to post and cancel the idle-unload runnable on the main thread. */
+    /** Used to post and cancel bar-shrink runnables on the main thread. */
     private val handler = Handler(Looper.getMainLooper())
 
     /**
-     * Posted by [onWindowHidden] and cancelled by [onWindowShown].
-     * When it fires the service is unbound so Android can destroy it and free the
-     * model sessions from RAM. The engine reloads transparently on next [onWindowShown].
+     * The active collector of [InferenceService.engineState], launched inside
+     * [onServiceConnected]. Cancelled on every unbind / disconnect / destroy so that we
+     * never have two collectors racing to push state from different binder instances
+     * (e.g. after [onServiceDisconnected] rebinds and a second [onServiceConnected]
+     * fires, or after a deliberate unbind leaves a dead binder's StateFlow dangling).
      */
-    private val idleUnloadRunnable = Runnable {
-        if (isBound) {
-            Log.d(
-                TAG,
-                "Keyboard idle for ${IDLE_UNLOAD_DELAY_MS / 1000}s - unbinding InferenceService to free model RAM"
-            )
-            unbindService(inferenceServiceConnection)
-            isBound = false
-            inferenceBinder = null
-            keyboardViewModel.setInferenceRepository(null)
-            keyboardViewModel.setEngineState(EngineState.Loading)
-        }
+    private var engineStateCollector: Job? = null
+
+    /**
+     * Cancels [engineStateCollector] and clears the binder-derived state on the VM.
+     * Called on every path that detaches us from the current binder (deliberate unbind,
+     * unexpected disconnect, destroy) so no stale collector keeps emitting from a dead
+     * binder and re-arming a "Ready but no repo" UI state.
+     */
+    private fun detachFromBinder() {
+        engineStateCollector?.cancel()
+        engineStateCollector = null
+        inferenceBinder = null
+        keyboardViewModel.setInferenceRepository(null)
     }
 
     private val inferenceServiceConnection: ServiceConnection = object : ServiceConnection {
@@ -107,9 +103,10 @@ class OutspokeInputMethodService :
             val b = binder as InferenceService.InferenceBinder
             inferenceBinder = b
 
-            keyboardViewModel.setInferenceRepository(b.getRepository())
-
-            lifecycleScope.launch {
+            // Replace any previous collector (e.g. left over from a rebind after
+            // onServiceDisconnected) so only one collector ever drives the VM.
+            engineStateCollector?.cancel()
+            engineStateCollector = lifecycleScope.launch {
                 b.getEngineState().collect { state ->
                     keyboardViewModel.setEngineState(state)
                     keyboardViewModel.setInferenceRepository(
@@ -118,13 +115,16 @@ class OutspokeInputMethodService :
                 }
             }
 
+            // Sync the repo immediately so onRecordStart does not see a Ready state with
+            // a null repo during the window before the first StateFlow emission.
+            keyboardViewModel.setInferenceRepository(b.getRepository())
+
             Log.d(TAG, "InferenceService connected - engine state: ${b.getEngineState().value}")
         }
 
         override fun onServiceDisconnected(name: ComponentName) {
             Log.w(TAG, "InferenceService disconnected unexpectedly - attempting rebind")
-            inferenceBinder = null
-            keyboardViewModel.setInferenceRepository(null)
+            detachFromBinder()
             // Show "Loading…" rather than "Model not downloaded" - the model is still present;
             // the service was killed by the OS (e.g. OOM) and we are about to restart it.
             keyboardViewModel.setEngineState(EngineState.Loading)
@@ -166,6 +166,18 @@ class OutspokeInputMethodService :
             keyboardViewModel.wordSuggestions.collect { }
         }
 
+        // If the user presses record while EngineState is Ready but
+        // no InferenceRepository is bound (a binder desync), let the VM nudge us so we can
+        // request a reload of the (still-present) model instead of silently opening the
+        // mic with no transcription.
+        keyboardViewModel.onMissingRepo = {
+            inferenceBinder?.reloadIfNeeded()
+            if (!isBound) {
+                bindService(inferenceServiceIntent(), inferenceServiceConnection, BIND_AUTO_CREATE)
+                isBound = true
+            }
+        }
+
         bindService(inferenceServiceIntent(), inferenceServiceConnection, BIND_AUTO_CREATE)
         isBound = true
         Log.d(TAG, "InferenceService bind requested")
@@ -180,12 +192,25 @@ class OutspokeInputMethodService :
 
     override fun onWindowShown() {
         super.onWindowShown()
-        handler.removeCallbacks(idleUnloadRunnable)
         val targetHeight = keyboardHeightPx + (if (barVisible) barSlotHeightPx else 0)
         Log.d(
             TAG,
-            "onWindowShown barVisible=$barVisible targetHeight=$targetHeight imeComposeView=${imeComposeView != null}"
+            "onWindowShown barVisible=$barVisible targetHeight=$targetHeight" +
+                    " imeComposeView=${imeComposeView != null} isBound=$isBound"
         )
+        // Rebind if a previous unbind (process-death recovery path or a future
+        // explicit unload) left us disconnected. Without this the keyboard stayed
+        // permanently detached from InferenceService after any unbind.
+        if (!isBound) {
+            bindService(inferenceServiceIntent(), inferenceServiceConnection, BIND_AUTO_CREATE)
+            isBound = true
+            Log.d(TAG, "onWindowShown - rebinding InferenceService")
+        }
+        // The model is kept warm across app switches because the
+        // service stays bound. If Android reclaimed it under memory pressure (the service
+        // closed the engine and went Unloaded), reload it now so it is ready by the time
+        // the user presses the talk button.
+        inferenceBinder?.reloadIfNeeded()
         applyWindowHeight(targetHeight, force = true)
     }
 
@@ -198,7 +223,12 @@ class OutspokeInputMethodService :
         // cause the window to come back at the wrong height.
         handler.removeCallbacks(shrinkWindowRunnable)
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
-        handler.postDelayed(idleUnloadRunnable, IDLE_UNLOAD_DELAY_MS)
+        // Intentionally do NOT unbind here. The inference service stays
+        // bound for the lifetime of the IME process so the ~700 MB Parakeet model remains
+        // warm in RAM across brief app switches and keyboard hide/show cycles, matching
+        // the user expectation that switching back "soon" does not require a full reload.
+        // Memory pressure is handled proactively by InferenceService's ComponentCallbacks2
+        // (it closes the engine and reloads on the next onWindowShown via reloadIfNeeded).
     }
 
     override fun onUnbindInput() {
@@ -207,13 +237,12 @@ class OutspokeInputMethodService :
     }
 
     override fun onDestroy() {
-        handler.removeCallbacks(idleUnloadRunnable)
         handler.removeCallbacks(shrinkWindowRunnable)
+        detachFromBinder()
         if (isBound) {
             unbindService(inferenceServiceConnection)
             isBound = false
         }
-        inferenceBinder = null
         wordSuggestionProvider.close()
         super.onDestroy()
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)

@@ -365,12 +365,41 @@ class KeyboardViewModel(
     private var captureJob: Job? = null
 
     /**
+     * Set by [dev.brgr.outspoke.ime.OutspokeInputMethodService] to a lambda that requests
+     * the inference service to reload its (still-present) model and re-establish the
+     * repository binding.
+     *
+     * Invoked from [onRecordStart] when the engine reports [EngineState.Ready] but no
+     * [InferenceRepository] is currently bound — a binder desync that would otherwise let
+     * the mic open with no transcription. The callback lets the IME react (rebind / reload)
+     * instead of the VM silently doing nothing.
+     */
+    var onMissingRepo: (() -> Unit)? = null
+
+    /**
      * Start microphone capture and pipe audio through the inference engine.
-     * Ignored if the engine is not yet [EngineState.Ready].
+     * Ignored if the engine is not yet [EngineState.Ready] or if no
+     * [InferenceRepository] is currently bound (a binder desync).
      */
     fun onRecordStart() {
         if (_engineState.value !is EngineState.Ready) {
             Log.w(TAG, "onRecordStart() ignored - engine not ready (${_engineState.value})")
+            return
+        }
+
+        // EngineState.Ready without a bound InferenceRepository means the UI shows
+        // a ready talk button but transcription would silently no-op (the old code fell
+        // into a "capture audio without transcription" branch). Surface the desync as a
+        // loading state and ask the IME to reload/rebind instead of opening the mic.
+        if (inferenceRepository == null) {
+            Log.w(
+                TAG,
+                "onRecordStart() ignored - engine Ready but no InferenceRepository bound (desync); requesting reload"
+            )
+            _uiState.value = KeyboardUiState.EngineLoading(
+                KeyboardUiState.LoadingReason.EngineStarting
+            )
+            onMissingRepo?.invoke()
             return
         }
 
@@ -390,15 +419,17 @@ class KeyboardViewModel(
             val myJob = coroutineContext[Job]
 
             try {
+                // Repo was verified non-null above; re-read defensively in case the binder
+                // detached between the guard and this launch. If it did become null, abort
+                // cleanly rather than capturing audio with nowhere to send it.
                 val repo = inferenceRepository
                 if (repo == null) {
-                    // Inference repo not yet bound - capture for amplitude feedback only.
-                    Log.w(TAG, "No InferenceRepository - capturing audio without transcription")
-                    audioCaptureManager.startCapture(
-                        vadEnabled = vadSensitivity.value,
-                    ).collect { /* amplitude updated internally */ }
-                    // Flow completed naturally (stopCapture called); no inference to wait for.
-                    _uiState.value = KeyboardUiState.Idle
+                    Log.w(TAG, "InferenceRepository detached before capture started - aborting session")
+                    _isContinuousMode.value = false
+                    _uiState.value = KeyboardUiState.EngineLoading(
+                        KeyboardUiState.LoadingReason.EngineStarting
+                    )
+                    onMissingRepo?.invoke()
                     return@launch
                 }
 

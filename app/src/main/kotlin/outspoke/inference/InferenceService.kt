@@ -4,7 +4,9 @@ import android.app.ActivityManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.ComponentCallbacks2
 import android.content.pm.ServiceInfo
+import android.content.res.Configuration
 import android.os.*
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -56,6 +58,21 @@ class InferenceService : LifecycleService() {
     @Volatile
     private var currentRepository: InferenceRepository? = null
 
+    /**
+     * The model id currently selected (or being loaded). Tracked so [reloadIfNeeded] can
+     * reload exactly the same model after a memory-pressure unload without re-reading
+     * preferences.
+     */
+    @Volatile
+    private var currentModelId: ModelId? = null
+
+    /**
+     * `true` after the engine was proactively closed under memory pressure (see
+     * [memoryCallback]). The next [reloadIfNeeded] call reloads the model and clears it.
+     */
+    @Volatile
+    private var memoryUnloaded: Boolean = false
+
     /** Mutex preventing concurrent [reloadForModel] calls from racing. */
     private val engineLoadMutex = Mutex()
 
@@ -68,6 +85,23 @@ class InferenceService : LifecycleService() {
         /** Returns the active [InferenceRepository], or `null` while the engine is loading. */
         fun getRepository(): InferenceRepository? = currentRepository
         fun getEngineState(): StateFlow<EngineState> = engineState
+
+        /**
+         * Reload the previously-selected model if it was closed under memory pressure.
+         *
+         * Called by the IME on [android.inputmethodservice.InputMethodService.onWindowShown]
+         * (and as a safety net from the keyboard VM when the user presses record while the
+         * engine is Unloaded). No-op when the engine is still loaded or already loading.
+         */
+        fun reloadIfNeeded() {
+            if (!memoryUnloaded) return
+            lifecycleScope.launch(Dispatchers.Default) {
+                val modelId = currentModelId
+                    ?: AppPreferences(applicationContext).selectedModelId.first()
+                Log.i(TAG, "reloadIfNeeded() - reloading $modelId after memory-pressure unload")
+                reloadForModel(modelId)
+            }
+        }
     }
 
     private val binder = InferenceBinder()
@@ -113,18 +147,95 @@ class InferenceService : LifecycleService() {
         // Observe the selected model preference and reload the engine whenever it changes.
         lifecycleScope.launch(Dispatchers.Default) {
             AppPreferences(applicationContext).selectedModelId.collect { modelId ->
+                currentModelId = modelId
+                memoryUnloaded = false  // a model change supersedes any memory-pressure unload
                 reloadForModel(modelId)
             }
         }
 
+        // Keep the model warm across keyboard hide/show and brief app
+        // switches by staying bound (the IME no longer unbinds on idle). To avoid being
+        // OOM-killed with ~700 MB resident, proactively close the engine when the OS
+        // signals running-low / critical memory pressure and let the IME reload it on the
+        // next onWindowShown via InferenceBinder.reloadIfNeeded().
+        registerMemoryCallback()
+
         // Watch the models/root directory to detect external changes (e.g. download complete).
         startModelWatcher()
+    }
+
+    /**
+     * Registered on the application context in [onCreate]; closes the loaded engine when
+     * the OS reports running-low / critical memory pressure so the ~700 MB Parakeet model
+     * is reclaimed cooperatively instead of via an OOM kill. Unregistered in [onDestroy].
+     *
+     * Only the running-low and critical levels trigger an unload — those are the levels at
+     * which the process is genuinely at risk. Background / moderate levels leave the model
+     * resident so brief app switches keep it warm.
+     */
+    private var memoryCallback: ComponentCallbacks2? = null
+
+    @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
+    private fun registerMemoryCallback() {
+        // Trim-memory levels are not strictly monotonic in severity:
+        //   UI_HIDDEN(20), BACKGROUND(40)        — routine backgrounding, NOT real pressure.
+        //   MODERATE(60), COMPLETE(80)          — backgrounded + pressure → unload.
+        //   RUNNING_LOW(10), RUNNING_CRITICAL(15) — process in foreground + pressure → unload.
+        // We unload on the pressure levels but NOT on UI_HIDDEN/BACKGROUND, which fire on every
+        // keyboard hide and would otherwise defeat the “keep the model warm across brief
+        // switches” goal. Reload is handled lazily by InferenceBinder.reloadIfNeeded() on the
+        // next onWindowShown.
+        val unloadLevels = setOf(
+            ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW,
+            ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL,
+            ComponentCallbacks2.TRIM_MEMORY_MODERATE,
+            ComponentCallbacks2.TRIM_MEMORY_COMPLETE,
+        )
+        val cb = object : ComponentCallbacks2 {
+            override fun onTrimMemory(level: Int) {
+                if (level !in unloadLevels) return
+                unloadDueToMemoryPressure(level)
+            }
+
+            override fun onLowMemory() {
+                unloadDueToMemoryPressure(ComponentCallbacks2.TRIM_MEMORY_COMPLETE)
+            }
+
+            override fun onConfigurationChanged(newConfig: Configuration) = Unit
+        }
+        memoryCallback = cb
+        applicationContext.registerComponentCallbacks(cb)
+    }
+
+    /**
+     * Closes the currently loaded engine cooperatively under memory pressure and marks the
+     * engine as memory-unloaded so [InferenceBinder.reloadIfNeeded] reloads it on next use.
+     * No-op if the engine is not currently loaded / ready (e.g. still loading or already
+     * unloaded). Serialized with [reloadForModel] via [engineLoadMutex].
+     */
+    private fun unloadDueToMemoryPressure(level: Int) {
+        if (currentEngine == null || _engineState.value != EngineState.Ready) return
+        Log.w(TAG, "Memory pressure (level=$level) - cooperatively closing engine to free RAM")
+        lifecycleScope.launch(Dispatchers.Default) {
+            engineLoadMutex.withLock {
+                if (currentEngine == null) return@withLock
+                currentEngine?.close()
+                currentEngine = null
+                currentRepository = null
+                memoryUnloaded = true
+                _engineState.value = EngineState.Unloaded
+                updateNotification(getString(R.string.notif_model_not_downloaded))
+                logMemoryUsage()
+            }
+        }
     }
 
     override fun onDestroy() {
         modelFileObserver?.stopWatching()
         modelFileObserver = null
         currentWatchDir = null
+        memoryCallback?.let { applicationContext.unregisterComponentCallbacks(it) }
+        memoryCallback = null
         super.onDestroy()
         currentEngine?.close()
         currentEngine = null
@@ -140,6 +251,10 @@ class InferenceService : LifecycleService() {
      */
     private suspend fun reloadForModel(modelId: ModelId) {
         engineLoadMutex.withLock {
+            // We are (re)loading on purpose, so any prior memory-pressure unload no
+            // longer applies — clear the flag so reloadIfNeeded() does not re-trigger.
+            memoryUnloaded = false
+
             // Close the current engine before replacing it.
             currentEngine?.let { engine ->
                 engine.close()
