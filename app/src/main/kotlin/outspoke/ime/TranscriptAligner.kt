@@ -161,5 +161,33 @@ object TranscriptAligner {
         // Return empty so we do not corrupt the already-committed text.
         return emptyList()
     }
+
+    /**
+     * Removes the overlap between the tail of [composing] and the head of [fresh],
+     * returning the portion of [fresh] that genuinely extends beyond [composing].
+     *
+     * Used by the field-scan recovery in [TextInjector]: when the model's variant
+     * instability (e.g. "in a sense" vs "and a sense" across strides) breaks the
+     * field-scan overlap detection, the field-scan result can re-include words that
+     * are already in the composing span. Concatenating them naively double-counts
+     * those words, desyncing the committed/composing trackers and dropping or
+     * duplicating text. This strips the longest suffix of [composing] that is a
+     * prefix of [fresh] (fuzzy [wordsMatch], ≥ 2 words) so each word is counted once.
+     *
+     * Unlike [findNewContent], when no ≥ 2-word overlap is found the full [fresh] is
+     * returned (the content is genuinely new and must not be dropped).
+     */
+    fun stripComposingOverlap(composing: List<String>, fresh: List<String>): List<String> {
+        if (composing.isEmpty() || fresh.isEmpty()) return fresh
+        val maxOverlap = minOf(composing.size, fresh.size)
+        for (overlap in maxOverlap downTo 2) {
+            val composingTail = composing.takeLast(overlap)
+            val freshHead = fresh.take(overlap)
+            if (composingTail.indices.all { i -> wordsMatch(composingTail[i], freshHead[i]) }) {
+                return fresh.drop(overlap)
+            }
+        }
+        return fresh
+    }
 }
 

@@ -15,6 +15,7 @@ import dev.brgr.outspoke.inference.TranscriptResult
 import dev.brgr.outspoke.settings.preferences.AppPreferences
 import dev.brgr.outspoke.ui.keyboard.components.WHISPER_LANGUAGE_OPTIONS
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
@@ -185,10 +186,10 @@ class KeyboardViewModel(
         val wac = textInjector?.wordAtCursor()
         _wordAtCursor.value = wac
         if (wac != null && !_suggestionBarDismissed.value) {
-            Log.d(TAG, "updateWordAtCursor → \"${wac.word}\" — querying corrector")
+            Log.d(TAG, "updateWordAtCursor (${wac.word.length} chars) — querying corrector")
             wordSuggestionProvider.getSuggestions(wac.word, wac.sentenceContext)
         } else {
-            Log.d(TAG, "updateWordAtCursor → no cursor word (wac=$wac, dismissed=${_suggestionBarDismissed.value})")
+            Log.d(TAG, "updateWordAtCursor → no cursor word (dismissed=${_suggestionBarDismissed.value})")
             _wordSuggestions.value = emptyList()
         }
     }
@@ -520,6 +521,23 @@ class KeyboardViewModel(
                             _diagnostics.value = _diagnostics.value.copy(
                                 windowTrims = _diagnostics.value.windowTrims + 1
                             )
+                        }
+
+                        // The model saw audio but couldn't resolve a word (weak
+                        // high-frequency fricatives). Surface a brief "didn't catch that"
+                        // cue, then return to the listening/idle state so the user can
+                        // retry without tapping to clear it.
+                        is TranscriptResult.NoSpeech -> {
+                            Log.d(TAG, "NoSpeech — surfacing 'didn't catch that'")
+                            _uiState.value = KeyboardUiState.NoSpeech
+                            viewModelScope.launch {
+                                delay(2000)
+                                if (_uiState.value is KeyboardUiState.NoSpeech) {
+                                    _uiState.value =
+                                        if (_isContinuousMode.value) KeyboardUiState.Listening
+                                        else KeyboardUiState.Idle
+                                }
+                            }
                         }
                     }
                 }

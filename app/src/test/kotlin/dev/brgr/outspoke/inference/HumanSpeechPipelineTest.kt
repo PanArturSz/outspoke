@@ -217,7 +217,9 @@ class HumanSpeechPipelineTest {
     fun `continuation flag is single-use -- first post-trim partial lowercase, second capitalised`() = runTest {
         val stableSentence = TranscriptResult.Final(
             // 13 words - wide enough that stableAudioEst covers the full 7 s window.
-            "Ich habe gerade gesehen dass das sehr gut funktioniert mit allen Wörtern hier."
+            // No terminal punctuation: SENTENCE_FINAL must not fire so the regular
+            // stable-chunk trim (and its continuation flag) is what this test exercises.
+            "Ich habe gerade gesehen dass das sehr gut funktioniert mit allen Wörtern hier"
         )
         val responses: List<TranscriptResult> = List(6) { stableSentence } + listOf(
             TranscriptResult.Final("nochmal von vorne bitte."),   // [6] 1st post-trim: isContinuation=true
@@ -481,7 +483,9 @@ class HumanSpeechPipelineTest {
      */
     @Test
     fun `halting multi-burst delivery triggers both regular and force trim in one session`() = runTest {
-        val burstPhrase = TranscriptResult.Final("Ja, das stimmt.")
+        // No terminal punctuation so SENTENCE_FINAL does not fire — this test must
+        // exercise the regular stable-chunk trim plus the force trim.
+        val burstPhrase = TranscriptResult.Final("Ja, das stimmt")
         // Responses 0-5: stable burst → regular trim fires at stride 5 (window 7 s)
         // Responses 6-15: fully divergent cycle → window rebuilds and force trim fires
         val responses: List<TranscriptResult> = List(6) { burstPhrase } + divergentResponses(10)
@@ -534,7 +538,7 @@ class HumanSpeechPipelineTest {
     fun `1A-1 blank dot-stride after regular trim silently consumes continuation flag`() = runTest {
         val stableSentence = TranscriptResult.Final(
             // 13 words - stableAudioEst at window 7 s = 7 s → dropSamples = 3 s ≥ MIN_TRIM
-            "Ich habe gerade gesehen dass das sehr gut funktioniert mit allen Wörtern hier."
+            "Ich habe gerade gesehen dass das sehr gut funktioniert mit allen Wörtern hier"
         )
         val responses: List<TranscriptResult> = List(6) { stableSentence } + listOf(
             TranscriptResult.Final(".."),                           // [6] blank - eats flag
@@ -584,7 +588,7 @@ class HumanSpeechPipelineTest {
     @Test
     fun `1A-2 bare comma artefact stride after regular trim silently consumes continuation flag`() = runTest {
         val stableSentence = TranscriptResult.Final(
-            "Ich habe gerade gesehen dass das sehr gut funktioniert mit allen Wörtern hier."
+            "Ich habe gerade gesehen dass das sehr gut funktioniert mit allen Wörtern hier"
         )
         val responses: List<TranscriptResult> = List(6) { stableSentence } + listOf(
             TranscriptResult.Final(","),                            // [6] bare comma → cleaned "" → eats flag
@@ -681,7 +685,7 @@ class HumanSpeechPipelineTest {
     fun `1A-4 two consecutive blank strides after trim -- first consumes flag second and real partial both see no-continuation`() =
         runTest {
             val stableSentence = TranscriptResult.Final(
-                "Ich habe gerade gesehen dass das sehr gut funktioniert mit allen Wörtern hier."
+                "Ich habe gerade gesehen dass das sehr gut funktioniert mit allen Wörtern hier"
             )
             val responses: List<TranscriptResult> = List(6) { stableSentence } + listOf(
                 TranscriptResult.Final(".."),                           // [6] 1st blank - consumes flag

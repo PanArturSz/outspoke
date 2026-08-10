@@ -5,8 +5,10 @@ import android.content.Context
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.os.Build
 import android.util.Log
 import dev.brgr.outspoke.R
+import dev.brgr.outspoke.settings.preferences.AppPreferences
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.*
@@ -28,27 +30,18 @@ private const val CHUNK_SAMPLES = 480
  */
 private const val HANGOVER_DRAIN_SAFETY_FRAMES = 20
 
-// VOICE_RECOGNITION disables hardware AGC, so raw RMS values are tiny
-// (speech ≈ 0.003-0.05, shouting ≈ 0.05-0.2 on most devices).  A fixed gain
-// can't cover the range of microphone sensitivities and room volumes, so we
-// use a peak-envelope follower:
-//   • Fast attack  → envelope rises to a new peak within ~7 chunks (280 ms).
-//   • Slow decay   → envelope falls back with a half-life of ~2 seconds after
-//                     the user stops talking, then hits the floor.
-//   • Floor        → keeps bars near-zero during genuine silence so the user
-//                     can see the mic is active without the bars being distracting.
-
-/** Minimum peak envelope - prevents infinite gain in total silence. */
-private const val AGC_FLOOR = 0.01f
-
-/** Per-chunk attack coefficient (0 = no rise, 1 = instant). */
-private const val AGC_ATTACK = 0.15f
-
-/**
- * Per-chunk decay multiplier.
- * Half-life = log(0.5) / log(AGC_DECAY) chunks ≈ 45 chunks ≈ 1.8 s.
- */
-private const val AGC_DECAY = 0.985f
+// Capture source: MediaRecorder.AudioSource.DEFAULT — the vendor-recommended source.
+// It arrives at a usable level with the platform's standard voice processing, so no
+// application-side gain is applied.
+//
+// History: rawer sources (VOICE_RECOGNITION, UNPROCESSED) with application-side gain
+// were tried in 2026-08 on the theory that the TDT decoder was level- or shape-
+// sensitive. That theory was disproven: the nemo128 frontend normalises each window to
+// a fixed level, so the decoder is level-invariant (the same waveform at 0.1x / 0.5x /
+// 1.0x yields byte-identical features). The short-word ("thanks") reliability gap was
+// a decode-loop bug in ParakeetEngine — the predictor state must freeze on blank and
+// the initial target must be blank — now fixed. DEFAULT is good enough; per-mic
+// calibration in settings remains an optional refinement.
 
 /**
  * Manages a single [AudioRecord] session and emits captured audio as a cold
@@ -64,6 +57,9 @@ private const val AGC_DECAY = 0.985f
  */
 class AudioCaptureManager(private val context: Context) {
 
+    /** Calibration-selected microphone, applied to each [AudioRecord] via setPreferredDevice. */
+    private val prefs = AppPreferences(context.applicationContext)
+
     private val _amplitude = MutableStateFlow(0f)
 
     /**
@@ -73,13 +69,6 @@ class AudioCaptureManager(private val context: Context) {
      */
     @Volatile
     private var stopRequested: Boolean = false
-
-    /**
-     * Running peak envelope for AGC.  Intentionally NOT reset between sessions so
-     * the gain stays calibrated across repeated short recordings in the same environment.
-     */
-    @Volatile
-    private var agcEnvelope: Float = AGC_FLOOR
 
     /**
      * Signals the active [startCapture] flow to exit its read loop and complete normally.
@@ -152,6 +141,8 @@ class AudioCaptureManager(private val context: Context) {
                 "AudioRecord failed to initialise (state=${recorder.state})"
             }
 
+            // Apply the calibration-selected microphone (no-op when unset or the device is gone).
+            applyPreferredMic(recorder)
 
             val buffer = ShortArray(CHUNK_SAMPLES)
 
@@ -163,7 +154,8 @@ class AudioCaptureManager(private val context: Context) {
                     val read = recorder.read(buffer, 0, buffer.size)
                     when {
                         read > 0 -> {
-                            val chunk = AudioChunk(samples = buffer.copyOf(read))
+                            val samples = buffer.copyOf(read)
+                            val chunk = AudioChunk(samples = samples)
                             val rms = calculateRms(chunk.samples)
                             _amplitude.value = normaliseAmplitude(rms)
 
@@ -247,25 +239,30 @@ class AudioCaptureManager(private val context: Context) {
     }
 
     /**
-     * Applies an adaptive peak-envelope AGC to [raw], returning a value in [0.0, 1.0]
-     * where 1.0 means "the loudest sound captured recently".
-     *
-     * The envelope rises quickly ([AGC_ATTACK]) so a sudden loud sound is tracked within
-     * ~280 ms, and decays slowly ([AGC_DECAY]) so a brief silence after speech lets the
-     * bars ease back to the floor over ~2 seconds rather than snapping immediately.
-     *
-     * Keeping [agcEnvelope] across sessions means subsequent short recordings in the
-     * same environment benefit from the already-calibrated gain without a warm-up period.
+     * Applies the calibration-selected microphone to [recorder] via `setPreferredDevice`
+     * (API 29+). No-op when no calibration has run ([preferredMicId] == 0), the API is too
+     * old, or the persisted device is no longer present (e.g. after a reboot or cable change).
      */
-    private fun normaliseAmplitude(raw: Float): Float {
-        agcEnvelope = if (raw > agcEnvelope) {
-            // Fast attack: blend envelope quickly toward the new peak.
-            raw * AGC_ATTACK + agcEnvelope * (1f - AGC_ATTACK)
-        } else {
-            // Slow decay: let envelope drift back toward the floor.
-            (agcEnvelope * AGC_DECAY).coerceAtLeast(AGC_FLOOR)
+    private suspend fun applyPreferredMic(recorder: AudioRecord) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        val id = prefs.preferredMicId.first()
+        if (id == 0) return
+        val device = MicCalibrationManager(context).deviceForId(id) ?: run {
+            Log.w(TAG, "Preferred mic id=$id not present — using system default")
+            return
         }
-        return (raw / agcEnvelope).coerceIn(0f, 1f)
+        try {
+            recorder.setPreferredDevice(device)
+            Log.d(TAG, "Applied preferred mic id=$id")
+        } catch (e: Exception) {
+            Log.w(TAG, "setPreferredDevice failed for id=$id", e)
+        }
     }
+
+    /**
+     * Returns the RMS for the waveform display, clamped to [0.0, 1.0].
+     */
+    private fun normaliseAmplitude(rms: Float): Float = rms.coerceIn(0f, 1f)
+
 }
 

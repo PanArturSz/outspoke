@@ -27,6 +27,7 @@ import dev.brgr.outspoke.ui.theme.OutspokeTheme
 @Composable
 fun PreferencesScreen(
     viewModel: PreferencesViewModel = viewModel(),
+    onNavigateToCalibration: () -> Unit = {},
 ) {
     val triggerMode by viewModel.triggerMode.collectAsState()
     val vadSensitivity by viewModel.vadSensitivity.collectAsState()
@@ -54,6 +55,7 @@ fun PreferencesScreen(
         onCancelDownload = viewModel::cancelDownload,
         onDeleteLanguage = viewModel::deleteLanguage,
         onResetTutorial = viewModel::resetTutorial,
+        onNavigateToCalibration = onNavigateToCalibration,
     )
 }
 
@@ -77,6 +79,7 @@ private fun PreferencesContent(
     onCancelDownload: (String) -> Unit = {},
     onDeleteLanguage: (String) -> Unit = {},
     onResetTutorial: () -> Unit = {},
+    onNavigateToCalibration: () -> Unit = {},
 ) {
     Column(
         modifier = Modifier
@@ -86,6 +89,26 @@ private fun PreferencesContent(
         verticalArrangement = Arrangement.spacedBy(24.dp),
     ) {
 
+
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(
+                text = stringResource(R.string.pref_mic_title),
+                style = MaterialTheme.typography.titleMedium,
+            )
+            Text(
+                text = stringResource(R.string.pref_mic_subtitle),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Button(
+                onClick = onNavigateToCalibration,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(stringResource(R.string.pref_mic_calibrate))
+            }
+        }
+
+        HorizontalDivider()
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text(
                 text = stringResource(R.string.pref_trigger_mode_title),
@@ -299,6 +322,7 @@ private fun PreferencesContent(
                 )
             }
         }
+
     }
 }
 

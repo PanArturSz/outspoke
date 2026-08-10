@@ -187,7 +187,8 @@ class AppPreferences(private val context: Context) {
      * Only tags from [SuggestionLanguage.TAG_SET] are valid.
      *
      * Defaults to empty string → empty set → no language is active even if the feature
-     * is enabled (so users must explicitly choose at least one language on first use).
+     * is enabled. Downloading a language pack adds its tag automatically (see
+     * [addSuggestionBarLanguage]); the user can still uncheck a language at any time.
      */
     val suggestionBarLanguages: Flow<Set<String>> = context.dataStore.data.map { prefs ->
         val raw = prefs[keySuggestionBarLanguages] ?: ""
@@ -197,6 +198,21 @@ class AppPreferences(private val context: Context) {
     suspend fun setSuggestionBarLanguages(tags: Set<String>) {
         context.dataStore.edit { prefs ->
             prefs[keySuggestionBarLanguages] = tags.joinToString(",")
+        }
+    }
+
+    /**
+     * Atomically adds [tag] to [suggestionBarLanguages] if it is not already present.
+     * Called when a language pack download completes so the language is active by
+     * default — no extra user step needed.
+     */
+    suspend fun addSuggestionBarLanguage(tag: String) {
+        context.dataStore.edit { prefs ->
+            val raw = prefs[keySuggestionBarLanguages] ?: ""
+            val current = if (raw.isBlank()) emptySet() else raw.split(",").toSet()
+            if (tag !in current) {
+                prefs[keySuggestionBarLanguages] = (current + tag).joinToString(",")
+            }
         }
     }
 
@@ -218,4 +234,21 @@ class AppPreferences(private val context: Context) {
     suspend fun setSuggestionBarDismissed(dismissed: Boolean) {
         context.dataStore.edit { prefs -> prefs[keySuggestionBarDismissed] = dismissed }
     }
+
+    private val keyPreferredMicId = intPreferencesKey("preferred_mic_id")
+
+    /**
+     * The [android.media.AudioDeviceInfo.id] the microphone calibration selected as the
+     * highest-fidelity input, or `0` when no calibration has been run (use the system
+     * default). [dev.brgr.outspoke.audio.AudioCaptureManager] applies it via
+     * `AudioRecord.setPreferredDevice`.
+     */
+    val preferredMicId: Flow<Int> = context.dataStore.data.map { prefs ->
+        prefs[keyPreferredMicId] ?: 0
+    }
+
+    suspend fun setPreferredMicId(id: Int) {
+        context.dataStore.edit { prefs -> prefs[keyPreferredMicId] = id }
+    }
+
 }

@@ -107,6 +107,11 @@ class PreferencesViewModel(application: Application) : AndroidViewModel(applicat
         downloadJobs[tag] = viewModelScope.launch {
             downloader.download(getApplication(), tag).collect { state ->
                 _downloadStates.value = _downloadStates.value + (tag to state)
+                // A completed download activates the language by default so the user
+                // does not have to tick it separately.
+                if (state is SuggestionDownloadState.Ready) {
+                    prefs.addSuggestionBarLanguage(tag)
+                }
             }
         }
     }
@@ -133,4 +138,5 @@ class PreferencesViewModel(application: Application) : AndroidViewModel(applicat
             viewModelScope.launch { prefs.setSuggestionBarLanguages(current - tag) }
         }
     }
+
 }

@@ -33,6 +33,8 @@ jobs:
         run: ./gradlew assembleDebug --no-daemon --stacktrace
 
       - name: Run unit tests
+        # Model-dependent integration tests skip themselves (JUnit Assume) when the
+        # Parakeet model directory is absent, so CI always runs the model-free suite.
         run: ./gradlew test --no-daemon
 
   release:

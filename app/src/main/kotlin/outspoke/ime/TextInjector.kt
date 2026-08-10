@@ -7,6 +7,7 @@ import android.view.inputmethod.InputConnection
 import dev.brgr.outspoke.ime.TranscriptAligner.findNewContent
 import dev.brgr.outspoke.ime.TranscriptAligner.normalizeWord
 import dev.brgr.outspoke.ime.TranscriptAligner.splitToWords
+import dev.brgr.outspoke.ime.TranscriptAligner.stripComposingOverlap
 import dev.brgr.outspoke.ime.TranscriptAligner.wordsMatch
 import dev.brgr.outspoke.ui.keyboard.WordAtCursor
 
@@ -107,6 +108,11 @@ class TextInjector(
      * Applied to transcript text immediately before it is written to the text field
      * (via [InputConnection.commitText] or [InputConnection.setComposingText]).
      *
+     * [isSentenceStart] tells the cleaner whether the first word of the text begins a
+     * sentence (utterance start, or right after `.` / `!` / `?`). Display cleaning is
+     * applied per frozen chunk and per composing span, so without this flag every chunk
+     * head would be capitalised mid-sentence.
+     *
      * This separation keeps the internal alignment tracking ([committedWords],
      * [composingWords]) on the structurally-cleaned model output — which preserves
      * word positions — while the field only ever receives fully display-cleaned text
@@ -115,7 +121,7 @@ class TextInjector(
      * Defaults to the identity function so tests that construct [TextInjector] directly
      * do not need to provide a cleaning implementation.
      */
-    private val displayCleanFn: (String) -> String = { it },
+    private val displayCleanFn: (text: String, isSentenceStart: Boolean) -> String = { text, _ -> text },
 ) {
 
     /**
@@ -169,6 +175,14 @@ class TextInjector(
     private var composingWords: List<String> = emptyList()
 
     /**
+     * Whether the head of the current composing span begins a sentence. Set whenever the
+     * span is (re)established; the span head must be re-rendered with the same flag when
+     * it is later frozen into the field (freeze commit, trim reset) so the field casing
+     * stays stable across the freeze.
+     */
+    private var composingIsSentenceStart: Boolean = false
+
+    /**
      * True once the first text has been injected in the current recording session.
      * Used to ensure a separator space is committed exactly once per session when the
      * preceding character in the field is not already whitespace.
@@ -188,8 +202,21 @@ class TextInjector(
      * Applies [displayCleanFn] to a word list joined by spaces.
      * Use this at every [InputConnection.commitText] and [InputConnection.setComposingText]
      * call site so the text field always shows fully display-cleaned output.
+     *
+     * [isSentenceStart] must describe the word in the field immediately before the text
+     * being written (see [isSentenceStartAfter]): the cleaner capitalises the first word
+     * only at a genuine sentence start.
      */
-    private fun displayClean(words: List<String>): String = displayCleanFn(words.joinToString(" "))
+    private fun displayClean(words: List<String>, isSentenceStart: Boolean): String =
+        displayCleanFn(words.joinToString(" "), isSentenceStart)
+
+    /**
+     * True when text written after [words] begins a new sentence: [words] is empty
+     * (nothing committed before it) or its last word ends with sentence-final
+     * punctuation.
+     */
+    private fun isSentenceStartAfter(words: List<String>): Boolean =
+        words.isEmpty() || words.last().last() in ".!?"
 
     /**
      * Commits a single space character to the [InputConnection] if the character
@@ -255,7 +282,7 @@ class TextInjector(
 
         // Display-clean the fresh text for use in field-scan recovery comparisons,
         // where the field content is already display-cleaned.
-        val freshDisplayWords by lazy { displayCleanFn(text).splitToWords() }
+        val freshDisplayWords by lazy { displayCleanFn(text, true).splitToWords() }
 
         // Inject separator space before first content of this session.
         ensureSessionSeparator()
@@ -277,14 +304,23 @@ class TextInjector(
                 val freezeCount = maxOf(0, allNewDisplay.size - MUTABLE_WORD_COUNT)
                 if (freezeCount > 0) {
                     val toFreeze = allNewDisplay.take(freezeCount)
-                    inputConnection.commitText(displayClean(toFreeze) + " ", 1)
+                    // The head of toFreeze is the head of the current composing span -
+                    // re-render it with the same sentence-start flag so the field casing
+                    // stays stable across the freeze.
+                    inputConnection.commitText(displayClean(toFreeze, composingIsSentenceStart) + " ", 1)
                     committedWords.addAll(toFreeze)
                 }
                 composingWords = allNewDisplay.drop(freezeCount)
                 if (composingWords.isNotEmpty()) {
-                    inputConnection.setComposingText(displayClean(composingWords), 1)
+                    // Head of the new span: follows the just-frozen words when a freeze
+                    // happened, otherwise it is the unchanged old span head.
+                    composingIsSentenceStart = if (freezeCount > 0) {
+                        isSentenceStartAfter(committedWords)
+                    } else composingIsSentenceStart
+                    inputConnection.setComposingText(displayClean(composingWords, composingIsSentenceStart), 1)
                 } else {
                     composingWords = emptyList()
+                    composingIsSentenceStart = false
                     inputConnection.finishComposingText()
                 }
                 return
@@ -342,29 +378,64 @@ class TextInjector(
                     // (2026-04-06 regression: "und der ist nicht besonders lang." dropped.)
                     val savedComposing = composingWords
 
-                    committedWords = fieldWords.toMutableList()
+                    // fieldChars includes the active composing span (provisional, not yet
+                    // committed). committedWords must track only the permanently committed
+                    // text, so strip the composing span before re-anchoring. Otherwise the
+                    // composing words get tracked as committed and are silently dropped when
+                    // the span is later replaced (text loss) or re-committed (duplication).
+                    val composingText = displayClean(savedComposing, composingIsSentenceStart)
+                    val committedFieldChars = if (composingText.isNotEmpty()) {
+                        val trimmedField = fieldChars.trimEnd()
+                        val trimmedComposing = composingText.trimEnd()
+                        if (trimmedField.endsWith(trimmedComposing)) {
+                            trimmedField.dropLast(trimmedComposing.length)
+                        } else {
+                            // Fallback: the composing span is the last savedComposing.size words.
+                            fieldWords.dropLast(savedComposing.size).joinToString(" ")
+                        }
+                    } else fieldChars
+                    committedWords = committedFieldChars.trim().split(Regex("\\s+"))
+                        .filter { it.isNotEmpty() }.toMutableList()
                     composingWords = emptyList()
+
+                    // Deduplicate the overlap between the composing span and the field-scan
+                    // result. When the model's variant instability (e.g. "in a sense" vs
+                    // "and a sense" across strides) breaks the field-scan overlap detection,
+                    // fieldNewContent can re-include words already in savedComposing. Naively
+                    // concatenating then double-counts them, desyncing committedWords/composing
+                    // and dropping or duplicating words. Strip the longest suffix of
+                    // savedComposing that is a prefix of fieldNewContent so each word is
+                    // counted once.
+                    val dedupedNewContent = stripComposingOverlap(savedComposing, fieldNewContent)
 
                     // Full display content = the words that were already composing (still
                     // visible in the editor region that setComposingText will overwrite) PLUS
                     // the genuinely new words discovered by the field-content scan.
-                    val allNewDisplay = savedComposing + fieldNewContent
+                    val allNewDisplay = savedComposing + dedupedNewContent
 
                     val freezeCount = maxOf(0, allNewDisplay.size - MUTABLE_WORD_COUNT)
                     if (freezeCount > 0) {
                         val toFreeze = allNewDisplay.take(freezeCount)
-                        inputConnection.commitText(displayClean(toFreeze) + " ", 1)
-                        // savedComposing words are already tracked inside committedWords
-                        // (they came from fieldWords).  Only add the fieldNewContent words
-                        // that were frozen to avoid double-counting.
-                        val composingFrozenCount = minOf(freezeCount, savedComposing.size)
-                        committedWords.addAll(fieldNewContent.take(freezeCount - composingFrozenCount))
+                        // The head of toFreeze is either the head of the saved composing
+                        // span (re-render with its flag) or, when the span was empty, the
+                        // word after the re-anchored committed words.
+                        val freezeStart = if (savedComposing.isNotEmpty()) composingIsSentenceStart
+                        else isSentenceStartAfter(committedWords)
+                        inputConnection.commitText(displayClean(toFreeze, freezeStart) + " ", 1)
+                        // committedWords was re-anchored to the committed buffer (composing
+                        // span stripped), so every frozen word - including the savedComposing
+                        // part - is new to the tracker and must be added.
+                        committedWords.addAll(toFreeze)
                     }
                     composingWords = allNewDisplay.drop(freezeCount)
                     if (composingWords.isNotEmpty()) {
-                        inputConnection.setComposingText(displayClean(composingWords), 1)
+                        composingIsSentenceStart = if (freezeCount > 0) {
+                            isSentenceStartAfter(committedWords)
+                        } else composingIsSentenceStart
+                        inputConnection.setComposingText(displayClean(composingWords, composingIsSentenceStart), 1)
                     } else {
                         composingWords = emptyList()
+                        composingIsSentenceStart = false
                         inputConnection.finishComposingText()
                     }
                     return
@@ -383,6 +454,7 @@ class TextInjector(
             alignmentRecoveryCount++
             val hadComposing = composingWords.isNotEmpty()
             composingWords = emptyList()
+            composingIsSentenceStart = false
             inputConnection.finishComposingText()
             // Ensure the next composing span doesn't run directly into the committed text.
             if (hadComposing) {
@@ -404,10 +476,16 @@ class TextInjector(
 
         // Freeze words that move beyond the mutable tail.
         val freezeCount = maxOf(0, newContent.size - MUTABLE_WORD_COUNT)
+        // The head of the frozen chunk is the head of the current composing span (the span
+        // always leads newContent) - re-render it with the span's flag. When no span
+        // exists (after a complete-alignment-failure reset) the head follows the
+        // committed words instead.
+        val freezeStart = if (composingWords.isNotEmpty()) composingIsSentenceStart
+        else isSentenceStartAfter(committedWords)
         if (freezeCount > 0) {
             val toFreeze = newContent.take(freezeCount)
             // commitText replaces the current composing span with the frozen words.
-            inputConnection.commitText(displayClean(toFreeze) + " ", 1)
+            inputConnection.commitText(displayClean(toFreeze, freezeStart) + " ", 1)
             committedWords.addAll(toFreeze)
         }
 
@@ -415,10 +493,14 @@ class TextInjector(
         val mutableTail = newContent.drop(freezeCount)
         if (mutableTail.isNotEmpty()) {
             composingWords = mutableTail
-            inputConnection.setComposingText(displayClean(mutableTail), 1)
+            composingIsSentenceStart = if (freezeCount > 0) {
+                isSentenceStartAfter(committedWords)
+            } else freezeStart
+            inputConnection.setComposingText(displayClean(mutableTail, composingIsSentenceStart), 1)
         } else {
             // All new content was frozen - nothing remains for the composing span.
             composingWords = emptyList()
+            composingIsSentenceStart = false
             inputConnection.finishComposingText()
         }
     }
@@ -462,7 +544,7 @@ class TextInjector(
         val finalWords = text.splitToWords()
         // Display-cleaned version of finalWords for field-scan comparisons (field holds
         // display-cleaned text).
-        val finalDisplayWords = displayCleanFn(text).splitToWords()
+        val finalDisplayWords = displayCleanFn(text, true).splitToWords()
         val remaining = findNewContent(savedCommitted, finalWords)
 
         // ── E5-Final fix: composing-anchor takes priority over the naive commit ──────────
@@ -494,7 +576,7 @@ class TextInjector(
                 // words together so that commitText (which replaces the composing span)
                 // includes everything. This is the only case in which the final is allowed
                 // to drive an overwrite of the span — and only to ADD words, never to drop.
-                val fullText = displayClean(savedComposing + composingRemaining)
+                val fullText = displayClean(savedComposing + composingRemaining, composingIsSentenceStart)
                 Log.d(
                     TAG,
                     "[COMMIT_FINAL] composing-anchor: +${composingRemaining.size} word(s) beyond composing"
@@ -542,7 +624,7 @@ class TextInjector(
 
         when {
             remaining.isNotEmpty() -> {
-                val remainingText = displayClean(remaining)
+                val remainingText = displayClean(remaining, isSentenceStartAfter(savedCommitted))
                 if (!wasSessionStarted && remainingText.isNotEmpty() && supportsComposing) {
                     // No partials were shown; inject the separator here if needed.
                     val preceding = inputConnection.getTextBeforeCursor(1, 0)
@@ -729,7 +811,7 @@ class TextInjector(
             val safeCount = maxOf(0, composingWords.size - TRIM_COMPOSING_DROP_TAIL)
             if (safeCount > 0) {
                 // Commit the stable leading words (trailing space included) and erase the tail.
-                val safeText = displayClean(composingWords.take(safeCount)) + " "
+                val safeText = displayClean(composingWords.take(safeCount), composingIsSentenceStart) + " "
                 inputConnection.commitText(safeText, 1)
             } else {
                 // Fewer composing words than the drop count - nothing safe to keep.
@@ -747,6 +829,7 @@ class TextInjector(
             )
         }
         composingWords = emptyList()
+        composingIsSentenceStart = false
 
         // Step 2: allow the next setPartial to re-establish the composing span unconditionally.
         lastPartial = ""
@@ -829,6 +912,7 @@ class TextInjector(
         lastPartial = ""
         committedWords = mutableListOf()
         composingWords = emptyList()
+        composingIsSentenceStart = false
         sessionStarted = false
         alignmentRecoveryCount = 0
         inputConnection.finishComposingText()

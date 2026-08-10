@@ -53,4 +53,12 @@ sealed class TranscriptResult {
      * for force-trims and silence-trims where no stable word list exists.
      */
     data class WindowTrimmed(val stableWords: List<String> = emptyList()) : TranscriptResult()
+
+    /**
+     * The model saw audio but could not resolve a word — typically a short utterance
+     * (a single word, or one buried in room noise) that fails the decode confidence gate.
+     * No text is committed; the keyboard should surface a brief "didn't catch that" cue
+     * instead of staying silent.
+     */
+    object NoSpeech : TranscriptResult()
 }

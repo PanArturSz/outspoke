@@ -23,6 +23,93 @@ private const val FALLBACK_BLANK_ID = 1024
  */
 private data class DecodeResult(val text: String, val confidence: Float)
 
+/**
+ * The TDT decoder's carry-over state between streaming chunks.
+ *
+ * The Parakeet TDT decoder is a temporal-difference transducer: each encoder frame is
+ * decoded against the previous token and an LSTM state. When audio is processed in
+ * chunks (the streaming path), this state is carried from the end of one chunk to the
+ * start of the next so the decoder continues exactly where it left off — no re-emission,
+ * no duplication. This is the same mechanism NeMo's `decoding_computer` uses with
+ * `prev_batched_state`.
+ *
+ *  - [lstmState1] / [lstmState2]: the decoder LSTM hidden / cell, each `[2, 1, 640]`
+ *    (1280 floats) as produced by `decoder_joint`'s `output_states_1/2`.
+ *  - [prevToken]: the last emitted token ID (the predictor embedding input for the next
+ *    frame). The blank token for a fresh start (see [ParakeetEngine.initialTdtState]).
+ *  - [frameDelta]: how far the decoder's frame position overshot the range end when the
+ *    previous chunk's decode loop exited. The TDT advance rule skips `duration` frames
+ *    *without running the joint on them*; when a duration jump at the last frame of a
+ *    chunk lands past the chunk boundary, the skipped frames must NOT be re-decoded in
+ *    the next chunk (the one-shot decoder never visits them — re-running the joint there
+ *    can emit phantom tokens and shifts the LSTM trajectory). The next chunk therefore
+ *    starts `frameDelta` frames after its nominal start. A negative [frameDelta] means
+ *    the loop terminated early (safety cap) and the next chunk must resume a few frames
+ *    before its nominal start so no frame is skipped.
+ */
+data class TdtState(
+    val lstmState1: FloatArray,
+    val lstmState2: FloatArray,
+    val prevToken: Int,
+    val frameDelta: Int = 0,
+)
+
+/**
+ * A single token candidate at one [TokenEmission]: the token ID and its log-softmax
+ * probability over the token portion `[0..blankId]`. The list of top candidates at an
+ * emission is the acoustic evidence the greedy decode previously discarded: the
+ * runner-up tokens are the model's own alternatives for that frame.
+ */
+data class EmissionToken(val token: Int, val logProb: Double)
+
+/**
+ * One non-blank token emission from the TDT decode loop, carrying the evidence needed
+ * to build acoustic word alternatives:
+ *  - [token]     the emitted (argmax) token ID
+ *  - [frame]     the encoder frame index at which the token was emitted
+ *  - [logProb]   log-softmax of [token] over `[0..blankId]`
+ *  - [topTokens] the top tokens at this emission (including [token]) with their
+ *                log-softmax probabilities — the acoustic runner-ups
+ */
+data class TokenEmission(
+    val token: Int,
+    val frame: Int,
+    val logProb: Double,
+    val topTokens: List<EmissionToken>,
+)
+
+/**
+ * The TDT decoder's state just before the joint model call at [frame]: the LSTM
+ * hidden / cell states and the previous token. A snapshot taken at every emitting
+ * joint call so a local word beam can re-start the joint model from the exact state
+ * the greedy decode had when it emitted a word's first token.
+ */
+data class FrameState(
+    val frame: Int,
+    val lstmState1: FloatArray,
+    val lstmState2: FloatArray,
+    val prevToken: Int,
+)
+
+/**
+ * Result of decoding a frame range: the emitted tokens, the updated state, confidence,
+ * per-emission acoustic evidence ([emissions] / [stateSnapshots]) for word-alternative
+ * capture, and the utterance-level confidence accumulators.
+ */
+private data class DecodeRangeResult(
+    val tokens: List<Int>,
+    val state: TdtState,
+    val confidence: Float,
+    /** Sum of per-emission log-softmax probabilities (non-blank tokens only). */
+    val logProbSum: Double,
+    /** Number of non-blank emissions in the range. */
+    val emissionCount: Int,
+    /** Per-emission evidence: token, frame, log-prob, and top-K acoustic runner-ups. */
+    val emissions: List<TokenEmission>,
+    /** Decoder state snapshots at each emitting joint call (for local word beams). */
+    val stateSnapshots: List<FrameState>,
+)
+
 private object Names {
     // nemo128.onnx  ← verified: expected [waveforms, waveforms_lens]
     const val PREP_IN_AUDIO = "waveforms"
@@ -204,15 +291,305 @@ class ParakeetEngine : SpeechEngine {
             val (encOut, encLen) = encode(e, enc, feats, featLen)
             feats.close()
 
-            // 4. Greedy TDT decode
-            val decode = greedyDecode(e, dec, encOut, encLen)
+            // 4. Greedy TDT decode (full range, fresh state)
+            val decode = decodeRange(e, dec, encOut, encLen, 0, encLen, initialTdtState())
             encOut.close()
 
-            if (decode.text.isBlank()) TranscriptResult.Partial("") else TranscriptResult.Final(decode.text, confidence = decode.confidence)
+            val text = detokenize(decode.tokens)
+            if (text.isBlank()) TranscriptResult.Partial("") else TranscriptResult.Final(text, confidence = decode.confidence)
         } catch (ex: Exception) {
             Log.e(TAG, "transcribe() failed", ex)
             TranscriptResult.Failure(ex)
         }
+    }
+
+    companion object {
+        /**
+         * Tuning knobs for the word-alternative capture (top-K token swaps + local word
+         * beam). All are exposed as parameters on the public functions so callers (the
+         * repository, tests) can override them without structural change.
+         */
+        const val TOP_K_TOKENS = 3        // runner-up tokens captured per emission
+        const val BEAM_WIDTH = 8          // live states in the local word beam
+        const val MAX_BEAM_STEPS = 200    // joint-call cap per word beam
+        const val MAX_ALTERNATIVES = 5    // word hypotheses returned per beam
+    }
+
+    /**
+     * A fresh TDT decoder state: zeroed LSTM hidden/cell and the blank token as the initial
+     * predictor target. The TDT predictor's first input must be the blank token (not SOS) -
+     * this matches transcribe-rs, and feeding SOS (token 0) makes short low-margin words
+     * collapse to empty output. Use this to start a new streaming session (the first chunk
+     * of an utterance).
+     */
+    fun initialTdtState(): TdtState = TdtState(FloatArray(2 * 640), FloatArray(2 * 640), blankId)
+
+    /**
+     * Preprocesses + encodes [samples] (float32 in [-1, 1], 16 kHz) and returns the encoder
+     * output tensor plus its total frame count.
+     *
+     * **The caller MUST close the returned [OnnxTensor]** when done (it is a native
+     * resource). This is the building block for the streaming path: the caller assembles a
+     * `[left context | chunk | right context]` buffer, encodes it, then decodes only the
+     * chunk's frame range via [decodeChunk] with a carried [TdtState].
+     *
+     * @throws IllegalStateException if the engine is not loaded.
+     */
+    fun encodeBuffer(samples: FloatArray): Pair<OnnxTensor, Int> {
+        check(isLoaded) { "Engine not loaded; call load() first" }
+        val e = env!!
+        val (feats, featLen) = preprocess(e, samples)
+        val (encOut, encLen) = encode(e, encSession!!, feats, featLen)
+        feats.close()
+        return encOut to encLen
+    }
+
+    /**
+     * Result of a streaming [decodeChunk]: the chunk's token IDs, the updated [TdtState],
+     * the chunk's confidence accumulators, and the per-emission acoustic evidence.
+     *
+     * [logProbSum] is the sum of per-emission log-softmax probabilities (non-blank tokens
+     * only) and [emissionCount] the count of those emissions. The caller accumulates both
+     * across chunks and computes the utterance confidence as
+     * `exp(totalLogProbSum / totalEmissions)` — the geometric mean of every token's
+     * probability. Summing log-probs (rather than averaging per-chunk confidences) is what
+     * makes the combined score independent of how the audio was chunked.
+     *
+     * [emissions] carries, per non-blank emission, the token, its frame index, its
+     * log-prob, and the top-K acoustic runner-up tokens — the evidence the word-alternative
+     * capture (top-K token swaps + local word beam) needs. [stateSnapshots] carries the
+     * decoder state at each emitting joint call so [localWordBeam] can re-start from the
+     * exact state the greedy decode had at a word's first token.
+     */
+    data class ChunkDecodeResult(
+        val tokens: List<Int>,
+        val state: TdtState,
+        val logProbSum: Double,
+        val emissionCount: Int,
+        val emissions: List<TokenEmission>,
+        val stateSnapshots: List<FrameState>,
+    )
+
+    /**
+     * Decodes encoder frames `[frameStart, frameEnd)` of [encoderOut] starting from the
+     * carried [state], returning the chunk's token IDs, the updated [TdtState], and the
+     * chunk's confidence accumulators (see [ChunkDecodeResult]).
+     *
+     * This is the streaming primitive: because the TDT decoder's LSTM state and previous
+     * token are carried across chunks, each chunk emits exactly its own new tokens — no
+     * re-emission of earlier content, no duplication. [totalLength] is the encoder output's
+     * full frame count (used for frame extraction); [frameStart]/[frameEnd] select the chunk
+     * sub-range (the left/right context frames are encoded but not decoded).
+     *
+     * @throws IllegalStateException if the engine is not loaded.
+     */
+    fun decodeChunk(
+        encoderOut: OnnxTensor,
+        totalLength: Int,
+        frameStart: Int,
+        frameEnd: Int,
+        state: TdtState,
+    ): ChunkDecodeResult {
+        check(isLoaded) { "Engine not loaded; call load() first" }
+        val result = decodeRange(env!!, decSession!!, encoderOut, totalLength, frameStart, frameEnd, state)
+        return ChunkDecodeResult(
+            result.tokens, result.state, result.logProbSum, result.emissionCount,
+            result.emissions, result.stateSnapshots,
+        )
+    }
+
+    /**
+     * Detokenises a list of token IDs to a display string (SentencePiece-aware). Exposed for
+     * the streaming path, which accumulates tokens across chunks and detokenises the running
+     * total for each partial.
+     */
+    fun detokenizeTokens(tokens: List<Int>): String = detokenize(tokens)
+
+    /**
+     * Returns `true` when [tokenId] is a SentencePiece word-initial token (its vocabulary
+     * entry starts with the `▁` word-boundary marker). Used by the repository to segment
+     * per-chunk emissions into words for acoustic-alternative capture.
+     */
+    fun tokenStartsWord(tokenId: Int): Boolean {
+        if (tokenId < 0 || tokenId >= vocabulary.size || tokenId == blankId) return false
+        return vocabulary[tokenId].startsWith("▁")
+    }
+
+    /**
+     * Bounded local word beam: re-runs the joint model over `[startFrame, endFrame]`
+     * starting from [initialState] (the decoder state the greedy decode had at the word's
+     * first token) and returns the top [maxAlternatives] detokenised word hypotheses with
+     * their length-normalised acoustic log-probs.
+     *
+     * This is the quality step of the word-alternative capture: a word is a *sequence* of
+     * SentencePiece tokens, and a real alternative word is often a *different token
+     * sequence* (e.g. a 2-token word vs the emitted 1-token word) that single-token
+     * swapping cannot reach. The beam branches on the top [topK] tokens at each step
+     * (plus the blank, which ends the word), carrying the LSTM state per beam.
+     *
+     * Bounded work: at most [beamWidth] live states, at most [maxSteps] joint calls total,
+     * and frames advance monotonically, so a pathological word cannot blow up decode time.
+     * The caller gates this on per-word confidence (only low-confidence words are beamed)
+     * and caps the number of beams per chunk.
+     *
+     * @throws IllegalStateException if the engine is not loaded.
+     */
+    fun localWordBeam(
+        encoderOut: OnnxTensor,
+        totalLength: Int,
+        startFrame: Int,
+        endFrame: Int,
+        initialState: FrameState,
+        beamWidth: Int = BEAM_WIDTH,
+        topK: Int = TOP_K_TOKENS,
+        maxSteps: Int = MAX_BEAM_STEPS,
+        maxAlternatives: Int = MAX_ALTERNATIVES,
+    ): List<WordAlternative> {
+        check(isLoaded) { "Engine not loaded; call load() first" }
+        val e = env!!
+        val session = decSession!!
+
+        val encShape = encoderOut.info.shape
+        val encDim = encShape[1].toInt()
+        val encData = FloatArray(encoderOut.floatBuffer.remaining())
+        encoderOut.floatBuffer.rewind()
+        encoderOut.floatBuffer.get(encData)
+
+        val stateShape = longArrayOf(2L, 1L, 640L)
+        val decOutputNames = session.outputNames.toList()
+
+        // One beam state: the decoder position plus the partial token sequence built so far.
+        class BeamState(
+            val frame: Int,
+            val prevToken: Int,
+            val lstm1: FloatArray,
+            val lstm2: FloatArray,
+            val tokens: IntArray,
+            val logProb: Double,
+        )
+
+        val start = BeamState(startFrame, initialState.prevToken,
+            initialState.lstmState1, initialState.lstmState2, IntArray(0), 0.0)
+        var live = listOf(start)
+        val finished = HashMap<String, Double>()   // detokenised word → best length-normalised log-prob
+        var steps = 0
+
+        // A joint call for one beam state at one frame: returns the top tokens + log-probs,
+        // the predicted duration, and the updated LSTM states.
+        class JointStep(
+            val topTokens: List<EmissionToken>,
+            val duration: Int,
+            val lstm1: FloatArray,
+            val lstm2: FloatArray,
+        )
+
+        fun jointCall(frame: Int, prevToken: Int, lstm1: FloatArray, lstm2: FloatArray): JointStep {
+            val frameData = FloatArray(encDim) { d -> encData[d * totalLength + frame] }
+            val frameTensor = OnnxTensor.createTensor(e, FloatBuffer.wrap(frameData), longArrayOf(1L, encDim.toLong(), 1L))
+            val targetTensor = OnnxTensor.createTensor(e, IntBuffer.wrap(intArrayOf(prevToken)), longArrayOf(1L, 1L))
+            val targetLenTensor = OnnxTensor.createTensor(e, IntBuffer.wrap(intArrayOf(1)), longArrayOf(1L))
+            val statesTensor1 = OnnxTensor.createTensor(e, FloatBuffer.wrap(lstm1), stateShape)
+            val statesTensor2 = OnnxTensor.createTensor(e, FloatBuffer.wrap(lstm2), stateShape)
+            val inputs = mapOf(
+                Names.DEC_IN_ENC_OUT to frameTensor,
+                Names.DEC_IN_TARGETS to targetTensor,
+                Names.DEC_IN_TARGET_LEN to targetLenTensor,
+                Names.DEC_IN_STATES_1 to statesTensor1,
+                Names.DEC_IN_STATES_2 to statesTensor2,
+            )
+            try {
+                session.run(inputs).use { result ->
+                    val logitsTensor = result.get(decOutputNames[0]).get() as OnnxTensor
+                    val logits = FloatArray(logitsTensor.floatBuffer.remaining())
+                    logitsTensor.floatBuffer.get(logits)
+
+                    // Single pass: log-softmax denominator + top-K tokens by logit.
+                    val maxLogit = (0..blankId).maxOf { logits[it] }
+                    var expSum = 0.0
+                    val topIdx = IntArray(topK)
+                    val topVal = DoubleArray(topK) { Double.NEGATIVE_INFINITY }
+                    for (k in 0..blankId) {
+                        val v = logits[k].toDouble()
+                        expSum += Math.exp(v - maxLogit)
+                        // Insert into the descending top-K (topVal[0] = best):
+                        // find the slot from the bottom, shifting smaller values down.
+                        if (v > topVal[topK - 1]) {
+                            var j = topK - 1
+                            while (j > 0 && v > topVal[j - 1]) {
+                                topVal[j] = topVal[j - 1]
+                                topIdx[j] = topIdx[j - 1]
+                                j--
+                            }
+                            topVal[j] = v
+                            topIdx[j] = k
+                        }
+                    }
+                    val logExpSum = Math.log(expSum)
+                    val top = (0 until topK)
+                        .map { i -> EmissionToken(topIdx[i], topVal[i] - maxLogit - logExpSum) }
+
+                    // Duration: argmax over the last numDurations logits.
+                    val nDur = numDurations
+                    val duration = if (nDur > 0) {
+                        val durBase = blankId + 1
+                        (0 until nDur.coerceAtLeast(1)).maxByOrNull { logits[durBase + it] } ?: 0
+                    } else 0
+
+                    val s1 = result.get(decOutputNames[2]).get() as OnnxTensor
+                    val lstm1Out = FloatArray(s1.floatBuffer.remaining()).also { s1.floatBuffer.get(it) }
+                    val s2 = result.get(decOutputNames[3]).get() as OnnxTensor
+                    val lstm2Out = FloatArray(s2.floatBuffer.remaining()).also { s2.floatBuffer.get(it) }
+
+                    return JointStep(top, duration, lstm1Out, lstm2Out)
+                }
+            } finally {
+                frameTensor.close()
+                targetTensor.close()
+                targetLenTensor.close()
+                statesTensor1.close()
+                statesTensor2.close()
+            }
+        }
+
+        while (live.isNotEmpty() && steps < maxSteps) {
+            val next = ArrayList<BeamState>(beamWidth * 2)
+            for (bs in live) {
+                if (bs.frame > endFrame) continue   // ran past the word's frame range
+                if (++steps >= maxSteps) break
+                val step = jointCall(bs.frame, bs.prevToken, bs.lstm1, bs.lstm2)
+
+                // Blank branch: the word ends here.
+                if (bs.tokens.isNotEmpty()) {
+                    val word = detokenize(bs.tokens.toList())
+                    if (word.isNotBlank()) {
+                        val norm = bs.logProb / bs.tokens.size
+                        if (norm > finished.getOrDefault(word, Double.NEGATIVE_INFINITY)) {
+                            finished[word] = norm
+                        }
+                    }
+                }
+
+                // Non-blank branches: top-K tokens (skip blank; it is handled above).
+                for (tok in step.topTokens) {
+                    if (tok.token == blankId) continue
+                    val newFrame = if (step.duration > 0) bs.frame + step.duration else bs.frame
+                    if (newFrame > endFrame) continue
+                    val newTokens = bs.tokens.copyOf(bs.tokens.size + 1).also { it[bs.tokens.size] = tok.token }
+                    next.add(
+                        BeamState(newFrame, tok.token, step.lstm1, step.lstm2, newTokens,
+                            bs.logProb + tok.logProb)
+                    )
+                }
+            }
+            // Prune to the beam's highest-scoring live states.
+            live = next.sortedByDescending { it.logProb }.take(beamWidth)
+        }
+
+        // Length-normalise (already done at finish) and take the top alternatives.
+        return finished.entries
+            .sortedByDescending { it.value }
+            .take(maxAlternatives)
+            .map { (word, lp) -> WordAlternative(word, lp.toFloat()) }
     }
 
     /** Releases all native ONNX Runtime resources. Safe to call more than once. */
@@ -322,29 +699,35 @@ class ParakeetEngine : SpeechEngine {
      *   blank:     t += max(1, predictedDuration)
      *   non-blank: emit token; t += predictedDuration (0 = stay at same frame)
      */
-    private fun greedyDecode(
+    private fun decodeRange(
         env: OrtEnvironment,
         session: OrtSession,
         encoderOut: OnnxTensor,
-        encodedLength: Int,
-    ): DecodeResult {
+        totalLength: Int,
+        frameStart: Int,
+        frameEnd: Int,
+        state: TdtState,
+    ): DecodeRangeResult {
         // Encoder layout: [1, D, T]
         val encShape = encoderOut.info.shape
         val encDim = encShape[1].toInt()   // D = 1024
-        val encodedLengthCopy = encodedLength
 
         val encData = FloatArray(encoderOut.floatBuffer.remaining())
         encoderOut.floatBuffer.rewind()
         encoderOut.floatBuffer.get(encData)
 
-        // LSTM state buffers: [2, 1, 640] = 1280 floats, initialised to zero
+        // LSTM state buffers: [2, 1, 640] = 1280 floats. Seeded from the carried
+        // [state] (zero + SOS for a fresh start) so streaming chunks continue where the
+        // previous chunk left off.
         val stateShape = longArrayOf(2L, 1L, 640L)
-        var lstmState1 = FloatArray(2 * 1 * 640)
-        var lstmState2 = FloatArray(2 * 1 * 640)
+        var lstmState1 = state.lstmState1.copyOf()
+        var lstmState2 = state.lstmState2.copyOf()
 
         val decOutputNames = session.outputNames.toList()
 
         val hypothesis = mutableListOf<Int>()
+        val emissions = mutableListOf<TokenEmission>()
+        val stateSnapshots = mutableListOf<FrameState>()
         // Per-token log-softmax accumulators for confidence scoring. Softmax is computed
         // over the token portion [0..blankId]; log(softmax[argmax]) is accumulated for every
         // non-blank emission. The geometric-mean probability exp(mean(logProbs)) is a
@@ -354,18 +737,26 @@ class ParakeetEngine : SpeechEngine {
         // first-stride outputs that would otherwise displace real content.
         var logProbSum = 0.0
         var nonBlankEmissions = 0
-        // Predictor embedding range is [0, blankId), so initialise with 0 (SOS).
-        // blankId is a *joint output label* only - never fed into the embedding layer.
-        var prevToken = 0
-        var t = 0
-        var maxIter = encodedLengthCopy * 20 + 50   // global safety cap
+        // prevToken is carried in from [state]; for a fresh start it is the blank token (see
+        // [initialTdtState]), which the joint's predictor embedding accepts as its first input.
+        // Subsequent steps feed the last emitted (non-blank) token.
+        var prevToken = state.prevToken
+        var t = frameStart
+        var maxIter = (frameEnd - frameStart) * 20 + 50   // per-range safety cap
         var tokensAtFrame = 0             // per-frame guard against duration=0 loops
         val maxTokensPerFrame = 30
         val maxHypothesis = 2000     // ~20-30 s of speech at typical token rate
 
-        while (t < encodedLengthCopy && maxIter-- > 0 && hypothesis.size < maxHypothesis) {
+        while (t < frameEnd && maxIter-- > 0 && hypothesis.size < maxHypothesis) {
+            // References to the pre-call decoder state (zero-copy: the LSTM update below
+            // allocates fresh arrays, so these keep pointing at the pre-call state).
+            // Kept so an emitting call can record a [FrameState] snapshot for the local
+            // word beam — the exact state the greedy decode had at the word's first token.
+            val preLstm1 = lstmState1
+            val preLstm2 = lstmState2
+            val preToken = prevToken
             // Extract one encoder frame: encoder[0, :, t] → frame shape [1, D, 1]
-            val frameData = FloatArray(encDim) { d -> encData[d * encodedLengthCopy + t] }
+            val frameData = FloatArray(encDim) { d -> encData[d * totalLength + t] }
 
             val frameTensor = OnnxTensor.createTensor(
                 env, FloatBuffer.wrap(frameData), longArrayOf(1L, encDim.toLong(), 1L)
@@ -402,42 +793,67 @@ class ParakeetEngine : SpeechEngine {
                     // Token: argmax over [0..blankId] (inclusive)
                     val predictedToken = (0..blankId).maxByOrNull { logits[it] } ?: blankId
 
-                    // Per-token confidence: log(softmax(predictedToken)) over the token
-                    // portion [0..blankId]. Computed for non-blank emissions only.
+                    // Per-token confidence + acoustic evidence: one pass over the token
+                    // portion [0..blankId] computes the argmax's log-softmax (confidence)
+                    // and the top-[TOP_K_TOKENS] tokens with their log-softmax
+                    // probabilities — the acoustic runner-ups the greedy decode discards.
+                    // Computed for non-blank emissions only.
                     if (predictedToken != blankId) {
-                        val tokenLogits = logits
-                        val maxLogit = (0..blankId).maxOf { tokenLogits[it] }
+                        val maxLogit = (0..blankId).maxOf { logits[it] }
                         var expSum = 0.0
+                        // Top-K selection by raw logit (monotonic with log-softmax):
+                        // maintain a sorted top-K while sweeping — O(V) time, K allocs.
+                        val topIdx = IntArray(TOP_K_TOKENS)
+                        val topVal = DoubleArray(TOP_K_TOKENS) { Double.NEGATIVE_INFINITY }
                         for (k in 0..blankId) {
-                            expSum += Math.exp((tokenLogits[k] - maxLogit).toDouble())
+                            val v = logits[k].toDouble()
+                            expSum += Math.exp(v - maxLogit)
+                            // Insert into the descending top-K (topVal[0] = best):
+                            // find the slot from the bottom, shifting smaller values down.
+                            if (v > topVal[TOP_K_TOKENS - 1]) {
+                                var j = TOP_K_TOKENS - 1
+                                while (j > 0 && v > topVal[j - 1]) {
+                                    topVal[j] = topVal[j - 1]
+                                    topIdx[j] = topIdx[j - 1]
+                                    j--
+                                }
+                                topVal[j] = v
+                                topIdx[j] = k
+                            }
                         }
-                        val logSoftmaxArgmax = (tokenLogits[predictedToken] - maxLogit).toDouble() -
-                                Math.log(expSum)
+                        val logExpSum = Math.log(expSum)
+                        val topTokens = (0 until TOP_K_TOKENS)
+                            .map { i -> EmissionToken(topIdx[i], topVal[i] - maxLogit - logExpSum) }
+                        // The argmax is topIdx[0] (ties keep the first max, matching
+                        // maxByOrNull); its log-softmax is the per-token confidence.
+                        val logSoftmaxArgmax = topVal[0] - maxLogit - logExpSum
                         logProbSum += logSoftmaxArgmax
                         nonBlankEmissions++
+                        emissions.add(TokenEmission(predictedToken, t, logSoftmaxArgmax, topTokens))
+                        stateSnapshots.add(FrameState(t, preLstm1, preLstm2, preToken))
                     }
 
                     // Duration: argmax over the last numDurations logits.
-                    // Snapshot to a local val so the compiler's flow analysis can prove
-                    // the range is non-empty inside the if-branch (mutable var fields are
-                    // not tracked across the guard check).
                     val nDur = numDurations
                     val predictedDur = if (nDur > 0) {
                         val durBase = blankId + 1
-                        // coerceAtLeast(1) is a no-op here (nDur > 0 is already guaranteed),
-                        // but it makes the bound provably ≥ 1 to the IDE's range-empty inspection,
-                        // which doesn't track numeric constraints through if-conditions.
                         (0 until nDur.coerceAtLeast(1)).maxByOrNull { logits[durBase + it] } ?: 0
                     } else 0
 
-                    // Update LSTM states on every step
-                    if (decOutputNames.size > 2) {
-                        val s1 = result.get(decOutputNames[2]).get() as OnnxTensor
-                        lstmState1 = FloatArray(s1.floatBuffer.remaining()).also { s1.floatBuffer.get(it) }
-                    }
-                    if (decOutputNames.size > 3) {
-                        val s2 = result.get(decOutputNames[3]).get() as OnnxTensor
-                        lstmState2 = FloatArray(s2.floatBuffer.remaining()).also { s2.floatBuffer.get(it) }
+                    // Update LSTM states only on non-blank emissions. The TDT predictor state
+                    // must FREEZE during blank runs (matching transcribe-rs): it advances only
+                    // when a real token is emitted, and the encoder frame carries the temporal
+                    // context across blanks. Updating on every step (including blank) lets a
+                    // low-margin short word collapse into a degenerate period loop.
+                    if (predictedToken != blankId) {
+                        if (decOutputNames.size > 2) {
+                            val s1 = result.get(decOutputNames[2]).get() as OnnxTensor
+                            lstmState1 = FloatArray(s1.floatBuffer.remaining()).also { s1.floatBuffer.get(it) }
+                        }
+                        if (decOutputNames.size > 3) {
+                            val s2 = result.get(decOutputNames[3]).get() as OnnxTensor
+                            lstmState2 = FloatArray(s2.floatBuffer.remaining()).also { s2.floatBuffer.get(it) }
+                        }
                     }
 
                     // TDT advance rule
@@ -454,7 +870,7 @@ class ParakeetEngine : SpeechEngine {
                             tokensAtFrame = 0
                         } else if (tokensAtFrame >= maxTokensPerFrame) {
                             // Safety: force advance when duration=0 emissions pile up on one frame
-                            Log.w(TAG, "greedyDecode: stuck at frame $t - forcing advance")
+                            Log.w(TAG, "decodeRange: stuck at frame $t - forcing advance")
                             t++
                             tokensAtFrame = 0
                         }
@@ -470,12 +886,28 @@ class ParakeetEngine : SpeechEngine {
             }
         }
 
-        val finalText = detokenize(hypothesis)
         val confidence = if (nonBlankEmissions > 0) {
             // Geometric mean of per-token probabilities: exp(mean(logProbs)).
             Math.exp(logProbSum / nonBlankEmissions).toFloat().coerceIn(0f, 1f)
         } else 1.0f
-        return DecodeResult(finalText, confidence)
+        // Frame position at exit relative to the range end. Positive: a duration jump at
+        // the boundary landed past frameEnd — the one-shot decoder never visits those
+        // frames, so the next chunk must start that many frames later (see TdtState).
+        // Negative: the loop terminated early (safety cap) before reaching frameEnd — the
+        // next chunk must resume at the actual position or those frames are skipped.
+        val frameDelta = t - frameEnd
+        if (frameDelta < 0) {
+            Log.w(TAG, "decodeRange: terminated $frameDelta frame(s) before frameEnd=$frameEnd (t=$t) - safety cap hit?")
+        }
+        return DecodeRangeResult(
+            hypothesis,
+            TdtState(lstmState1, lstmState2, prevToken, frameDelta),
+            confidence,
+            logProbSum,
+            nonBlankEmissions,
+            emissions,
+            stateSnapshots,
+        )
     }
 
     /**

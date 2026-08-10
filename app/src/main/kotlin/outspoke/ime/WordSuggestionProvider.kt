@@ -5,13 +5,23 @@ import android.util.Log
 import dev.brgr.outspoke.ime.correction.SuggestionFileManager
 import dev.brgr.outspoke.ime.correction.SuggestionLanguage
 import dev.brgr.outspoke.ime.correction.WordCorrector
+import dev.brgr.outspoke.inference.WordAlternative
 import kotlinx.coroutines.*
 
 private const val TAG = "WordSuggestionProvider"
 
 /**
- * Provides spelling-correction suggestions for the word currently under the cursor,
- * using an on-device phonetic + edit-distance + n-gram pipeline.
+ * Provides word-correction suggestions for the word currently under the cursor.
+ *
+ * **Primary source — acoustic alternatives:** the ASR model's own word-level
+ * alternatives captured at decode time (top-K token swaps + bounded local beam), looked
+ * up via [acousticLookup] (wired to the [dev.brgr.outspoke.inference.InferenceRepository]
+ * by [OutspokeInputMethodService]) and rescored per active language with the ARPA
+ * language model and the surrounding sentence context.
+ *
+ * **Fallback — dictionary:** when the word has no acoustic evidence (decoded before
+ * capture was active, evicted, or manually typed), the corrector falls back to
+ * phonetic + edit-distance dictionary candidates.
  *
  * Works entirely offline — no system spell-checker, no permissions, no network.
  *
@@ -29,9 +39,20 @@ private const val TAG = "WordSuggestionProvider"
  * 5. Call [close] when the IME is destroyed.
  */
 class WordSuggestionProvider(private val context: Context) {
-
     /** Invoked on the **main thread** with the top-5 correction suggestions. */
     var onSuggestions: (List<String>) -> Unit = {}
+
+    /**
+     * Lookup for the ASR model's acoustic alternatives for a word. Set by
+     * [OutspokeInputMethodService] to a lambda reading the bound
+     * [dev.brgr.outspoke.inference.InferenceRepository]'s acoustic cache; returns an
+     * empty list when the repository is not bound or the word has no acoustic evidence
+     * (the corrector then falls back to dictionary candidates).
+     *
+     * Called from the provider's background scope — the lookup must be thread-safe and
+     * fast (a single bounded-cache read).
+     */
+    var acousticLookup: ((word: String) -> List<WordAlternative>)? = null
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
@@ -75,18 +96,22 @@ class WordSuggestionProvider(private val context: Context) {
     fun getSuggestions(word: String, sentenceContext: String = "") {
         val langs = activeLanguages
         if (langs.isEmpty() || word.isBlank()) return
-        Log.d(TAG, "getSuggestions(\"$word\", langs=$langs)")
+        Log.d(TAG, "getSuggestions(${word.length} chars, langs=$langs)")
 
         scope.launch {
             val leftContext = extractLeftContext(sentenceContext, word)
+            // The ASR model's own alternatives for this word (language-independent —
+            // captured at decode time). Empty when the word has no acoustic evidence.
+            val acoustic = acousticLookup?.invoke(word) ?: emptyList()
             val merged = HashMap<String, Float>()   // candidate → best score
 
             for (tag in langs) {
                 val corrector = correctors[tag] ?: continue
                 if (!corrector.isReady) continue
-                // correct() returns candidates already ranked; assign a score 1/(rank+1)
-                // and keep the best score across languages so duplicates are deduplicated.
-                corrector.correct(word, leftContext).forEachIndexed { rank, candidate ->
+                // correct() returns candidates already ranked (acoustic + LM, log domain);
+                // assign a score 1/(rank+1) and keep the best score across languages so
+                // duplicates are deduplicated.
+                corrector.correct(word, leftContext, acoustic).forEachIndexed { rank, candidate ->
                     val score = 1f / (rank + 1)
                     merged[candidate] = maxOf(merged.getOrDefault(candidate, 0f), score)
                 }

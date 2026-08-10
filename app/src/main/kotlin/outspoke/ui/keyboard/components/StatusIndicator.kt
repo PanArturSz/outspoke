@@ -94,6 +94,8 @@ fun StatusIndicator(
                 message = localizedLoadingMessage(state),
                 onOpenCompanionApp = onOpenCompanionApp,
             )
+
+            is KeyboardUiState.NoSpeech -> NoSpeechIndicator()
         }
     }
 }
@@ -195,6 +197,17 @@ private fun TranscribingIndicator() {
             maxLines = 1,
         )
     }
+}
+
+/** Shown briefly when the model detected audio but couldn't resolve a word. */
+@Composable
+private fun NoSpeechIndicator() {
+    Text(
+        text = stringResource(R.string.status_no_speech),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        maxLines = 1,
+    )
 }
 
 @Composable
