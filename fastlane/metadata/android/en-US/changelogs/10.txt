@@ -1,0 +1,7 @@
+Eighth patch (v0.2.5).
+
+Transcription reliability: long dictations no longer drop or repeat words; streaming matches one-shot quality; short phrases like "thanks" are reliable.
+
+Word suggestions reworked: candidates are limited to real dictionary words, ranked by the acoustic decoder and the language model.
+
+Optional microphone calibration in Settings picks the best mic on multi-mic devices.

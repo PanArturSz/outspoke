@@ -40,6 +40,10 @@ class CandidateGenerator(
     // phonetic code → list of indices into [dictionary]
     private val phoneticIndex = HashMap<String, MutableList<Int>>(60_000)
 
+    // Lowercase dictionary words, for O(1) membership tests (lexicon filtering of the
+    // ASR model's acoustic alternatives, which are lexicon-unconstrained).
+    private val wordSet = HashSet<String>(100_000)
+
     @Volatile
     var isReady = false
         private set
@@ -64,6 +68,7 @@ class CandidateGenerator(
                         val word = line.substring(0, tab)
                         val lp = line.substring(tab + 1).toFloatOrNull() ?: -5f
                         dictionary.add(word to lp)
+                        wordSet.add(word.lowercase())
                         val code = phoneticCode(word)
                         phoneticIndex.getOrPut(code) { ArrayList(4) }.add(idx)
                         idx++
@@ -88,9 +93,24 @@ class CandidateGenerator(
         return try {
             queryCandidates(word)
         } catch (e: Exception) {
-            Log.e(TAG, "getCandidates failed for \"$word\"", e)
+            Log.e(TAG, "getCandidates failed", e)
             emptyList()
         }
+    }
+
+    /**
+     * Returns `true` when [word] is a dictionary entry (case-insensitive — the set is
+     * stored lowercase, so both a lowercase dict and a capitalised query match).
+     *
+     * Used to filter the ASR model's acoustic alternatives to genuine words: the TDT
+     * decoder is lexicon-unconstrained, so its beam can emit acoustically plausible
+     * token strings that are not words in the language.
+     *
+     * Returns `false` when the dictionary is not yet loaded.
+     */
+    fun isKnownWord(word: String): Boolean {
+        if (!isReady) return false
+        return wordSet.contains(word.lowercase())
     }
 
     private fun queryCandidates(word: String): List<String> {

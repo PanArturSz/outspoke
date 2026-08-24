@@ -56,17 +56,17 @@ on-device via ONNX Runtime; no audio ever leaves the device after the one-time m
 
 ## 2. Module and Package Map
 
-Single Gradle module (). All Kotlin source lives under .
+Single Gradle module (app). All Kotlin source lives under app/src/main/kotlin/ (package root dev.brgr.outspoke).
 
 | Package | Key files | Responsibility |
 |---|---|---|
-| audio | AudioCaptureManager, SileroVadFilter, RMSVadFilter, VadFilter, AudioChunk, PermissionHelper | Mic capture, PCM chunking, Voice Activity Detection |
-| inference | SpeechEngine, ParakeetEngine, WhisperEngine, VoxtralEngine, SpeechEngineFactory, InferenceRepository, InferenceService, TranscriptResult, EngineState, PipelineDiagnostics, NumberNormaliser, GrammarCorrector | ASR pipeline, sliding window, post-processing, foreground service |
+| audio | AudioCaptureManager, MicCalibrationManager, SileroVadFilter, RMSVadFilter, VadFilter, AudioChunk, PermissionHelper | Mic capture, PCM chunking, Voice Activity Detection, optional mic calibration |
+| inference | SpeechEngine, ParakeetEngine, WhisperEngine, VoxtralEngine, SpeechEngineFactory, InferenceRepository, InferenceService, TranscriptResult, EngineState, PipelineDiagnostics, NumberNormaliser, GrammarCorrector, AcousticCandidates | ASR pipeline, sliding window, post-processing, foreground service, acoustic word-alternative capture |
 | ime | OutspokeInputMethodService, TextInjector, TranscriptAligner, EnterAction, WordSuggestionProvider | Keyboard service, composing text management, alignment, word-correction facade |
 | ime/correction | WordCorrector, CandidateGenerator, ArpaLanguageModel, SuggestionFileDownloader, SuggestionFileManager, SuggestionLanguage, DoubleMetaphone, KolnerPhonetik, EditDistance | On-device word correction + downloadable language pack management |
 | settings/model | ModelId, ModelRegistry, ModelDownloadManager, ModelStorageManager, ModelState, ModelViewModel, DownloadService | Model enumeration, download, SHA-256 verification, on-disk paths |
 | settings/preferences | AppPreferences, PreferencesViewModel | DataStore-backed user preferences |
-| settings/screens | HomeScreen, ModelScreen, PreferencesScreen | Settings Compose UI |
+| settings/screens | HomeScreen, ModelScreen, PreferencesScreen, MicCalibrationScreen | Settings Compose UI |
 | ui/keyboard | KeyboardViewModel, KeyboardUiState, KeyboardScreen, ImeComposeView, WordAtCursor | IME Compose hosting, UI state |
 | ui/keyboard/components | TalkButton, SuggestionBar, WaveformBar, StatusIndicator, KeyboardActionButton, KeyboardTutorialOverlay, LanguageSelector | Keyboard UI sub-components |
 | ui/theme | OutspokeKeyboardTheme | Compose theming |
@@ -79,9 +79,9 @@ Single Gradle module (). All Kotlin source lives under .
 
 **AudioCaptureManager**
 
-- Opens AudioRecord with source VOICE_RECOGNITION, 16 kHz mono PCM-16.
+- Opens AudioRecord with source DEFAULT (the vendor-recommended source), 16 kHz mono PCM-16. No application-side gain: DEFAULT arrives at a usable level.
 - Emits 480-sample (30 ms) chunks as a cold Flow<AudioChunk>.
-- Applies a peak-envelope follower for amplitude normalisation: fast attack (~7 chunks), slow decay (~2 s half-life), hard floor.
+- When the user has run mic calibration, applies the selected microphone via AudioRecord.setPreferredDevice (no-op when unset or the device is gone).
 - On stop: drains the hardware buffer then waits HANGOVER_DRAIN_SAFETY_FRAMES = 20 frames (600 ms) to flush VAD hangover before the flow completes.
 
 **VadFilter interface**
@@ -103,6 +103,12 @@ Single Gradle module (). All Kotlin source lives under .
 **RMSVadFilter** (fallback)
 
 - Energy threshold with the same 3-layer onset/pre-roll/hangover structure.
+
+**MicCalibrationManager / MicScorer** (optional, user-triggered)
+
+- MicCalibrationScreen (settings) lists the input microphones, records a short reference clip on each, and ranks them with MicScorer (HF energy fraction + percentile SNR).
+- The winning mic id is persisted (AppPreferences.preferredMicId) and applied to production capture via AudioRecord.setPreferredDevice; falls back to the system default when the device is no longer present.
+- Strict opt-in: nothing runs unless the user opens the calibration screen.
 
 ---
 
@@ -183,7 +189,7 @@ Single Gradle module (). All Kotlin source lives under .
 
 **ModelDownloadManager** downloads via OkHttp with resume support, verifies SHA-256 after each file, emits ModelState.Downloading(progress).
 
-**AppPreferences** (DataStore, store name outspoke_prefs): trigger_mode (String, default HOLD), vad_sensitivity (Float, default 0.0), selected_model_id (String), whisper_language (String, default "auto"), postprocessing_enabled (Boolean, default true), show_pipeline_diagnostics (Boolean, default false), keyboard_tutorial_shown (Boolean, default false), forced_language (String?, default null), format_numbers_as_digits (Boolean, default true), suggestion_bar_enabled (Boolean, default false), suggestion_bar_languages (String, comma-separated BCP-47 tags, default ""), suggestion_bar_dismissed (Boolean, default false).
+**AppPreferences** (DataStore, store name outspoke_prefs): trigger_mode (String, default HOLD), vad_sensitivity (Float, default 0.0), selected_model_id (String), whisper_language (String, default "auto"), postprocessing_enabled (Boolean, default true), show_pipeline_diagnostics (Boolean, default false), keyboard_tutorial_shown (Boolean, default false), forced_language (String?, default null), format_numbers_as_digits (Boolean, default true), suggestion_bar_enabled (Boolean, default false), suggestion_bar_languages (String, comma-separated BCP-47 tags, default ""), suggestion_bar_dismissed (Boolean, default false), preferredMicId (Int, default 0).
 
 ---
 
@@ -268,6 +274,10 @@ Key constants in InferenceRepository:
 | MIN_CONTEXT_SAMPLES | 4 s | Tail context kept after a stable-chunk trim |
 | FORCE_TRIM_WINDOW_SAMPLES | 12 s | Aggressive trim when strides diverge |
 | SILENCE_TRIM_STRIDES | 2 | Consecutive blank strides before proactive trim |
+| SHORT_UTTERANCE_THRESHOLD_SAMPLES | 2.5 s | Below this the final flush uses the short-utterance path |
+| MIN_PADDING_SAMPLES | 1.25 s | Tail zero-pad floor for short-utterance decodes |
+| SHORT_UTT_LEAD_SILENCE_SAMPLES | 600 ms | Lead silence prepended to short-utterance decodes |
+| CONFIDENCE_THRESHOLD | 0.55 | Legacy (non-Parakeet) final-confidence gate; the Parakeet short-utterance path uses a plausibility floor (≥2 word chars) instead |
 
 **Trim triggers** (all emit TranscriptResult.WindowTrimmed):
 
@@ -277,7 +287,7 @@ Key constants in InferenceRepository:
 
 **Mid-session final**: when isSilenceBoundary is set on an AudioChunk, the repository emits Final(isUtteranceBoundary = true) without stopping capture (useful for long continuous dictation).
 
-**Recording-stop final**: one final inference runs over the remaining window when the audio flow completes. Clips shorter than 1.25 s are zero-padded to give the encoder sufficient frames.
+**Recording-stop final**: one final inference runs over the remaining window when the audio flow completes. **Short utterances** (< SHORT_UTTERANCE_THRESHOLD_SAMPLES) get a decode-context retry: the TDT decoder is extremely context-sensitive on short clips (real-model probes: 600 ms of leading silence flips blank decodes into correct words; trailing digital silence can flip a correct decode into blank). The primary attempt re-decodes the buffer from frame 0 with SHORT_UTT_LEAD_SILENCE_SAMPLES of silence prepended (and a tail zero-pad to MIN_PADDING_SAMPLES when still short). A decode is accepted when it contains a plausible word (≥2 letters/digits); if the lead attempt yields no word, one retry runs the original context (no lead), and the first attempt with a word wins. There is **no confidence gate** on the Parakeet short-utterance path: a correct-but-low-confidence decode is always emitted (the geometric-mean confidence of a single short word is fragile — one low-probability token, often the trailing period, can drag it below any fixed threshold — and other Parakeet tools emit whatever the model decodes rather than gating on confidence). A no-word decode in both contexts stays silent (no output, no warning) rather than emitting a hallucination.
 
 ---
 
@@ -480,6 +490,8 @@ Introduced in v0.2.0. Opt-in; disabled by default (`suggestion_bar_enabled = fal
 
 After each dictation commit, a `SuggestionBar` chip row animates into view above the keyboard. Tapping a word in the transcription (tracked as `WordAtCursor` in `KeyboardUiState`) triggers a candidate query. Up to 5 ranked candidates are shown; tapping one replaces the word in the text field.
 
+**Candidates are acoustic-first.** At decode time the Parakeet TDT decoder already computes the full 8198-way acoustic distribution at every step; the engine captures the top-K runner-up tokens per emission and, for low-confidence words, runs a bounded local beam over the word's frame range. The repository segments emissions into words and writes the per-word alternatives (word + length-normalised acoustic log-prob) to a bounded `AcousticCandidateCache` (§13.6). When the user queries a word, those alternatives are rescored with the ARPA language model and the surrounding context — the standard ASR n-best re-ranking combination — and the result is what the bar shows. Because the TDT decoder is lexicon-unconstrained (its beam can emit acoustically plausible strings that are not words), the acoustic alternatives are filtered to genuine dictionary words (case-insensitive, deduplicated case-insensitively) before rescoring; the dictionary (phonetic + edit distance) is a low-prior fallback for words with no usable acoustic evidence (manually typed, decoded before capture was active, or all acoustic alternatives filtered out as non-words).
+
 ### Language Packs
 
 Each supported language requires two files, stored in `<filesDir>/suggestion_files/<tag>/`:
@@ -487,7 +499,7 @@ Each supported language requires two files, stored in `<filesDir>/suggestion_fil
 | File | Approximate size | Purpose |
 |---|---|---|
 | `dict_<tag>.txt` | ~2 MB | Frequency-sorted word list (`word\tlog10_freq` per line) |
-| `lm_<tag>.arpa` | ~6 MB | Bigram ARPA language model for re-ranking |
+| `lm_<tag>.arpa` | ~6 MB | ARPA language model (bigram packs; the parser also supports trigrams) for context re-ranking |
 
 Files are downloaded on demand from `https://github.com/minburg/outspoke-data/releases/download/v2` — **the only external URL used at runtime besides the Hugging Face model download**. The URL is pinned to a specific release tag in `SuggestionFileManager.BASE_URL`; bump the tag there (and in the `outspoke-data` repository) whenever file format or content changes.
 
@@ -525,30 +537,43 @@ Supported languages (`SuggestionLanguage` enum):
 
     WordSuggestionProvider.getSuggestions(word, sentenceContext)
         |
-        for each active language tag:
-            WordCorrector.correct(word, leftContext)
-                |
-                CandidateGenerator.getCandidates(word)
-                    1. Phonetic index lookup (Kölner Phonetik for "de", Double Metaphone otherwise)
-                    2. Damerau-Levenshtein sweep (distance ≤ 2, ±3 char length filter)
-                    → up to 50 candidates ranked by corpus log-frequency
-                |
-                ArpaLanguageModel.scoreInContext(candidate, leftContext)
-                    → bigram log-probability for context-aware re-ranking
-                |
-                combined score = 0.7 * lmScore + 0.3 * freqScore
+        acoustic = acousticLookup(word)          ← InferenceRepository.getAcousticAlternatives(word)
+                                                      (bounded acoustic cache, populated at decode time)
         |
-        merge candidates across languages (best score wins on duplicate)
+        for each active language tag:
+            WordCorrector.correct(word, leftContext, acoustic)
+                |
+                if acoustic is non-empty:
+                    candidates = acoustic alternatives (top-K token swaps + local beam)
+                                filtered to genuine dictionary words (case-insensitive)
+                                + deduplicated case-insensitively (highest score wins)
+                    if nothing survives the filter → dictionary fallback below
+                else:
+                    CandidateGenerator.getCandidates(word)      ← dictionary fallback
+                        1. Phonetic index lookup (Kölner Phonetik for "de", Double Metaphone otherwise)
+                        2. Damerau-Levenshtein sweep (distance ≤ 2, ±3 char length filter)
+                        → up to 50 candidates
+                |
+                score = acousticLogProb + λ · ln(10) · lmLog10(candidate | leftContext)
+                    acousticLogProb: length-normalised natural-log acoustic probability
+                                      (dictionary fallback uses the fixed prior -2.0)
+                    lmLog10: raw ARPA log10 with standard backoff (trigram → bigram → unigram)
+                    λ = 0.5 — the acoustic term dominates; the LM breaks ties / fits context
+                |
+                → top 5 candidates (query word excluded)
+        |
+        merge candidates across languages (best rank wins on duplicate)
         → top 5 delivered on main thread via onSuggestions callback
 
 ### Key classes
 
 | Class | Responsibility |
 |---|---|
-| `WordSuggestionProvider` | Public façade; manages `WordCorrector` instances per language; owns background `CoroutineScope` |
-| `WordCorrector` | Combines `CandidateGenerator` + `ArpaLanguageModel` for one language |
-| `CandidateGenerator` | Loads dict file; phonetic index + edit-distance sweep |
-| `ArpaLanguageModel` | Loads ARPA file; bigram log-prob lookup |
+| `WordSuggestionProvider` | Public façade; manages `WordCorrector` instances per language; owns background `CoroutineScope`; `acousticLookup` wired to the `InferenceRepository` by the IME service |
+| `WordCorrector` | Log-domain AM+LM rescoring (`acousticLogProb + λ·ln10·lmLog10`); lexicon-filters acoustic alternatives to dictionary words; dictionary fallback with fixed prior |
+| `CandidateGenerator` | Loads dict file; phonetic index + edit-distance sweep (dictionary fallback); case-insensitive `isKnownWord` membership (lexicon filter) |
+| `ArpaLanguageModel` | Loads ARPA file; trigram/bigram/unigram scoring with standard backoff, raw log10 |
+| `WordAlternative` / `AcousticCandidateCache` | Per-word acoustic alternative (word + length-normalised log-prob); bounded thread-safe cache, cleared per recording session |
 | `SuggestionFileManager` | On-disk path constants; `isLanguageReady()` check |
 | `SuggestionFileDownloader` | OkHttp download with range-resume + SHA-256 verification; emits `SuggestionDownloadState` flow |
 | `SuggestionBar` | Compose chip row; animated appear/disappear (300 ms ease-out / ease-in) |
@@ -559,6 +584,47 @@ Supported languages (`SuggestionLanguage` enum):
 - `WordSuggestionProvider` loads only the languages explicitly selected by the user via `AppPreferences.suggestionBarLanguages`.
 - Downloads come **only** from `github.com/minburg/outspoke-data`. Do not add other external hosts.
 - The feature is a strict no-op (no background work, no memory overhead) when `suggestionBarEnabled = false`.
+- Acoustic capture runs inside the decode loop (the logits are already in memory) — top-K token swaps are near-free; the local beam is gated on per-word confidence (< 0.6) and capped at 3 beams per chunk, so confident speech (the common case) adds no beam cost.
+- The acoustic cache is process-local to the `InferenceRepository` (the long-lived bound service), bounded to 200 words (oldest evicted first), and cleared at the start of each recording session — RAM stays flat (tens of KB) and stale evidence never leaks across utterances.
+- Rescoring is in the log domain (`acousticLogProb + λ·ln10·lmLog10`, no clamping): the acoustic term is the grounded signal and dominates; the LM differentiates.
+- Acoustic alternatives are lexicon-filtered to genuine dictionary words (case-insensitive, deduplicated case-insensitively with the highest-scoring casing kept) before rescoring — the TDT decoder is lexicon-unconstrained and its beam can emit acoustically plausible strings that are not words. When nothing survives the filter, the dictionary fallback applies.
+
+---
+
+## 13.6 Acoustic Word-Alternative Capture
+
+The decode-time half of the word-correction subsystem (see §13.5). Lives in the `inference` package because only the inference layer has the logits, the encoder features, and the decoder state.
+
+### What is captured
+
+`ParakeetEngine.decodeRange` records, for every non-blank emission: the argmax token, its log-softmax probability (the per-token confidence), and the top-3 tokens with their log-softmax probabilities — the acoustic runner-ups the greedy decode previously discarded. It also snapshots the LSTM state + previous token before each emitting joint call (`FrameState`), so a word beam can restart from the exact state the greedy decode had at the word's first token.
+
+`InferenceRepository` (the Parakeet streaming path) segments each chunk's emissions into words — a SentencePiece word starts at a `▁`-initial token; the chunk's final segment is deferred across the chunk boundary because a word may continue. For every completed word it builds alternatives:
+
+1. **Top-K token swaps** (every word, near-free): swap each runner-up token into each position, detokenise, keep the best length-normalised log-prob per resulting word.
+2. **Bounded local beam** (gated + capped): for words with per-word confidence < 0.6 that are fully contained in the chunk, `ParakeetEngine.localWordBeam` re-runs the joint model over the word's frame range from the greedy state snapshot, branching on the top-3 tokens per step (plus blank, which ends the word), carrying the LSTM state per beam. At most 8 live states, 200 joint calls, 5 hypotheses. This finds alternative *token sequences* (a different word shape) that single-token swapping cannot reach.
+
+The best ≤ 5 alternatives per word (the word itself excluded, case-insensitively) are written to the `AcousticCandidateCache`, keyed by the lower-cased word.
+
+### Tuning knobs (constants, no structural change)
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `TOP_K_TOKENS` | 3 | runner-up tokens captured per emission |
+| `BEAM_WIDTH` | 8 | live states in the local word beam |
+| `MAX_BEAM_STEPS` | 200 | joint-call cap per word beam |
+| `MAX_ALTERNATIVES` | 5 | word hypotheses returned per beam |
+| `ACUSTIC_CONF_GATE` | 0.6 | per-word confidence below which the beam runs |
+| `MAX_BEAMS_PER_CHUNK` | 3 | beam cap per decoded chunk |
+| `MAX_CACHED_ALTERNATIVES` | 5 | alternatives cached per word |
+| `AcousticCandidateCache.DEFAULT_CAPACITY` | 200 | distinct words held in the cache |
+| `WordCorrector.LM_WEIGHT` (λ) | 0.5 | LM weight in the rescoring combination |
+| `WordCorrector.DICT_ACOUSTIC_PRIOR` | -2.0 | acoustic prior for dictionary-fallback candidates |
+
+### Invariants
+- Capture never changes the decoded text — it only reads logits/state the decode loop already computed; the greedy path is untouched.
+- A beam failure (logged, caught) degrades that word to token-swap candidates only; it never fails the transcription.
+- The cache is read from IME threads via a single lock-protected map read; the writer is the inference worker.
 
 ---
 
@@ -570,20 +636,40 @@ testOptions { unitTests.isReturnDefaultValues = true }.
 | Test file | What it covers |
 |---|---|
 | audio/AudioChunkTest | AudioChunk data class, normalisation |
+| audio/MicScorerTest | Mic quality scoring (HF fraction, percentile SNR) |
 | audio/RMSVadFilterTest | Energy VAD onset/hangover logic |
 | ime/TranscriptAlignerTest | All 3 layers of findNewContent |
 | ime/TextInjectorTest | Composing span management, trim resets |
-| ime/FakeInputConnection | Test double for InputConnection |
-| inference/InferenceRepositoryTest | Sliding window, trim triggers |
+| ime/ReplaceCursorWordTest | TextInjector.replaceCursorWord: replace at cursor, insert between words |
+| ime/WordAtCursorTest | TextInjector.wordAtCursor: left-fragment extraction, sentence context |
+| ime/WordSuggestionProviderTest | Acoustic-first facade: lookup, context extraction, main-thread delivery |
+| ime/correction/WordCorrectorTest | Log-domain AM+LM rescoring, acoustic dominance, lexicon filter (non-word drop, case dedup), dictionary fallback |
+| ime/correction/ArpaLanguageModelTest | Trigram scoring, ARPA backoff, production CRLF/literal-`\n` format |
+| ime/correction/CorrectionRecallTest | recall@5 harness: noisy-audio ASR errors vs acoustic+LM pipeline (real model) |
+| inference/InferenceRepositoryTest | Sliding-window buffering strategy (stride/trim constants) |
 | inference/InferenceRepositoryPipelineTest | Full pipeline integration |
-| inference/HumanSpeechPipelineTest | Representative speech scenarios |
+| inference/HumanSpeechPipelineTest | Human speech patterns: pauses, restarts, trailing-off, force-trim |
+| inference/ShortUtterancePipelineTest | Short-utterance decode-context retry: no-lead-in word, VAD path, silence/noise no-Final (real model) |
+| inference/ParakeetEngineRealAudioTest | One-shot engine path against WAV fixtures (real model) |
+| inference/RealAudioPipelineTest | Full-stack streaming dictation, pipe-* no-loss/no-duplication battery (real model) |
+| inference/StreamingParityTest | Streaming vs one-shot output parity across fixtures (real model) |
+| inference/AcousticCaptureIntegrationTest | Top-K capture, local beam, cache population (real model) |
+| inference/AcousticCandidateCacheTest | Bounded thread-safe acoustic cache: eviction, case, concurrency |
 | inference/CleanTranscriptTest | All 8 post-processing steps |
 | inference/CollapsePhrasesTest | Phrase-loop deduplication |
 | inference/CollapseStuttersTest | Stutter collapse |
+| inference/ScriptHallucinationTest | Script-consistency hallucination filter, 20% threshold boundary |
+| inference/ParakeetAllLanguagesTest | Post-processing does not block or corrupt any Parakeet-supported language's script |
+| inference/ParakeetLanguageTest | Language forcing threads into cleanTranscript (EN vs DE filler/disfluency handling) |
+| inference/NumberNormaliserTest | Number-word to digit normalisation |
+| inference/GrammarCorrectorTest | GrammarCorrector implementations and repository integration |
 | inference/TranscriptResultTest | TranscriptResult sealed class |
-| inference/FakeSpeechEngine | Controllable SpeechEngine test double |
-| e2e/GoldenPathTest | End-to-end happy path |
-| ExampleUnitTest | Placeholder |
+| inference/WavReaderTest | WAV parsing, resampling, channel downmix |
+| e2e/GoldenPathTest | End-to-end repository + TextInjector golden paths |
+
+Test helpers: RealAudioTestUtils (model-dir resolution, WER), WavReader, FakeSpeechEngine, FakeInputConnection.
+
+**CI behaviour:** the real-model tests resolve the model directory (-Dtest.model.dir > $OUTSPOKE_TEST_MODEL_DIR > ~/.cache/outspoke-test-model/parakeet-tdt-0.6b-v3/) and skip themselves (JUnit Assume) when it is absent — so the CI pipeline always runs the model-free suite, while a local machine with the model present runs everything.
 
 Instrumented tests (device/emulator required) in app/src/androidTest/, run with ./gradlew connectedAndroidTest.
 

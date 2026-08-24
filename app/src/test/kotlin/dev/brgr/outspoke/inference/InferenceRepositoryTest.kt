@@ -205,12 +205,12 @@ class ShortUtteranceRepositoryTest {
 
         repo.transcribe(flowOf(AudioChunk(ShortArray(sampleRate / 2)))).toList()
 
-        // The engine must have been called with at least MIN_PADDING_SAMPLES (32 000).
+        // The engine must have been called with at least MIN_PADDING_SAMPLES (20 000 = 1.25 s).
         assertTrue("Engine should have been called at least once", capturedSizes.isNotEmpty())
         val lastSize = capturedSizes.last()
         assertTrue(
-            "Short-utt path must deliver ≥ MIN_PADDING_SAMPLES (32000) but got $lastSize",
-            lastSize >= sampleRate * 2
+            "Short-utt path must deliver ≥ MIN_PADDING_SAMPLES (20000) but got $lastSize",
+            lastSize >= sampleRate * 5 / 4
         )
     }
 
@@ -258,41 +258,39 @@ class ShortUtteranceRepositoryTest {
 
 class EstimateConfidenceTest {
 
-    private val sampleRate = 16_000
-
     @Test
     fun `given Final with meaningful multi-character text, then confidence is above threshold`() {
-        // "hello" = 5 word chars → wordCharCount >= 2 → confidence = 1.0
+        // "hello" = 5 word chars → plausibility floor passes → engine confidence (default 1.0)
         val result = TranscriptResult.Final("hello")
-        val confidence = estimateConfidence(result, sampleRate)
+        val confidence = estimateConfidence(result)
         assertTrue("Confidence should be >= threshold for real text", confidence >= CONFIDENCE_THRESHOLD)
     }
 
     @Test
     fun `given Final with empty text, then confidence is 0`() {
         val result = TranscriptResult.Final("")
-        val confidence = estimateConfidence(result, sampleRate)
+        val confidence = estimateConfidence(result)
         assertEquals(0.0f, confidence, 0.001f)
     }
 
     @Test
     fun `given Final with single punctuation character, then confidence is 0`() {
         val result = TranscriptResult.Final(".")
-        val confidence = estimateConfidence(result, sampleRate)
+        val confidence = estimateConfidence(result)
         assertEquals(0.0f, confidence, 0.001f)
     }
 
     @Test
     fun `given Failure result, then confidence is 0`() {
         val result = TranscriptResult.Failure(RuntimeException("engine error"))
-        val confidence = estimateConfidence(result, sampleRate)
+        val confidence = estimateConfidence(result)
         assertEquals(0.0f, confidence, 0.001f)
     }
 
     @Test
     fun `given single letter text, then confidence is 0 (fewer than 2 word chars)`() {
         val result = TranscriptResult.Final("a")
-        val confidence = estimateConfidence(result, sampleRate)
+        val confidence = estimateConfidence(result)
         assertEquals(0.0f, confidence, 0.001f)
     }
 
@@ -300,8 +298,40 @@ class EstimateConfidenceTest {
     fun `given two-character text, then confidence is above threshold`() {
         // "hi" = 2 word chars → minimum passing case
         val result = TranscriptResult.Final("hi")
-        val confidence = estimateConfidence(result, sampleRate)
+        val confidence = estimateConfidence(result)
         assertTrue("Two word-chars should pass confidence gate", confidence >= CONFIDENCE_THRESHOLD)
+    }
+
+    @Test
+    fun `given Final with low engine confidence, then the real confidence is returned`() {
+        // Plausible text but the model was uncertain → the engine's per-token
+        // geometric-mean probability must flow through (no longer a binary proxy).
+        val result = TranscriptResult.Final("hello", confidence = 0.30f)
+        val confidence = estimateConfidence(result)
+        assertEquals(0.30f, confidence, 0.001f)
+    }
+
+    @Test
+    fun `given Final with high engine confidence, then the real confidence is returned`() {
+        val result = TranscriptResult.Final("hello world", confidence = 0.92f)
+        val confidence = estimateConfidence(result)
+        assertEquals(0.92f, confidence, 0.001f)
+    }
+
+    @Test
+    fun `given Partial with engine confidence, then the real confidence is returned`() {
+        val result = TranscriptResult.Partial("hello", confidence = 0.75f)
+        val confidence = estimateConfidence(result)
+        assertEquals(0.75f, confidence, 0.001f)
+    }
+
+    @Test
+    fun `given single punctuation character with high engine confidence, then plausibility floor still wins`() {
+        // The model can emit a lone "." with high token confidence — the
+        // word-character floor must still score it 0.0.
+        val result = TranscriptResult.Final(".", confidence = 0.99f)
+        val confidence = estimateConfidence(result)
+        assertEquals(0.0f, confidence, 0.001f)
     }
 }
 
@@ -362,6 +392,31 @@ class ConfidenceGateTest {
         assertTrue(
             "High-confidence short utterance should emit Final but got ${results.last()}",
             finals.isNotEmpty()
+        )
+    }
+
+    /**
+     * A short utterance where the engine returns plausible text (many word chars)
+     * but with a LOW per-token confidence — a hallucination the character-count
+     * proxy could not detect. The real-confidence gate must fire → Failure.
+     */
+    @Test
+    fun `given plausible text with low engine confidence, then Failure is emitted`() = runTest {
+        // "hello there" has 10 word chars (passes the plausibility floor) but the
+        // engine's per-token confidence is 0.30 < CONFIDENCE_THRESHOLD (0.55).
+        val repo = InferenceRepository(
+            engineReturning(TranscriptResult.Final("hello there", confidence = 0.30f))
+        )
+
+        val results = repo.transcribe(
+            flowOf(AudioChunk(ShortArray(sampleRate / 2)))  // 0.5 s → short-utterance path
+        ).toList()
+
+        assertTrue("Should emit at least one result", results.isNotEmpty())
+        val last = results.last()
+        assertTrue(
+            "Low engine-confidence short utterance should emit Failure but got $last",
+            last is TranscriptResult.Failure
         )
     }
 

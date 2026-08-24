@@ -19,13 +19,13 @@ All source lives under `app/src/main/kotlin/` (package root `dev.brgr.outspoke`)
 
 | Package | Key files | Responsibility |
 |---|---|---|
-| `inference` | `SpeechEngine`, `ParakeetEngine`, `WhisperEngine`, `VoxtralEngine`, `InferenceRepository`, `InferenceService`, `SpeechEngineFactory`, `TranscriptResult`, `EngineState`, `PipelineDiagnostics`, `NumberNormaliser`, `GrammarCorrector` | ASR pipeline, sliding window, post-processing, foreground service |
-| `audio` | `AudioCaptureManager`, `SileroVadFilter`, `RMSVadFilter`, `VadFilter`, `AudioChunk`, `PermissionHelper` | Mic capture + VAD |
+| `inference` | `SpeechEngine`, `ParakeetEngine`, `WhisperEngine`, `VoxtralEngine`, `InferenceRepository`, `InferenceService`, `SpeechEngineFactory`, `TranscriptResult`, `EngineState`, `PipelineDiagnostics`, `NumberNormaliser`, `GrammarCorrector`, `AcousticCandidates` | ASR pipeline, sliding window, post-processing, foreground service, acoustic word-alternative capture |
+| `audio` | `AudioCaptureManager`, `MicCalibrationManager`, `SileroVadFilter`, `RMSVadFilter`, `VadFilter`, `AudioChunk`, `PermissionHelper` | Mic capture + VAD + optional mic calibration |
 | `ime` | `OutspokeInputMethodService`, `TextInjector`, `TranscriptAligner`, `EnterAction`, `WordSuggestionProvider` | Keyboard / text insertion |
 | `ime/correction` | `WordCorrector`, `CandidateGenerator`, `ArpaLanguageModel`, `SuggestionFileDownloader`, `SuggestionFileManager`, `SuggestionLanguage`, `DoubleMetaphone`, `KolnerPhonetik`, `EditDistance` | On-device word correction + language pack management |
 | `settings/model` | `ModelRegistry`, `ModelId`, `ModelDownloadManager`, `ModelStorageManager`, `ModelState`, `ModelViewModel`, `DownloadService` | Model lifecycle |
 | `settings/preferences` | `AppPreferences`, `PreferencesViewModel` | DataStore-backed user preferences |
-| `settings/screens` | `HomeScreen`, `ModelScreen`, `PreferencesScreen` | Settings Compose UI |
+| `settings/screens` | `HomeScreen`, `ModelScreen`, `PreferencesScreen`, `MicCalibrationScreen` | Settings Compose UI |
 | `ui/keyboard` | `KeyboardViewModel`, `KeyboardUiState`, `KeyboardScreen`, `ImeComposeView`, `WordAtCursor` | IME Compose hosting, UI state |
 | `ui/keyboard/components` | `TalkButton`, `SuggestionBar`, `WaveformBar`, `StatusIndicator`, `KeyboardActionButton`, `KeyboardTutorialOverlay`, `LanguageSelector` | Keyboard UI sub-components |
 | `ui/theme` | `OutspokeKeyboardTheme` | Compose theming |
@@ -44,7 +44,7 @@ All source lives under `app/src/main/kotlin/` (package root `dev.brgr.outspoke`)
 
 **`TextInjector` maintains a composing span** of the last 6 words via `InputConnection.setComposingText`. Words before that are permanently committed. `TranscriptAligner.findNewContent` does a three-layer overlap search (full prefix → suffix-prefix ≥ 2 words → interior scan) to locate genuinely new tokens in each partial.
 
-**`InferenceRepository` sliding window:** partials fire every ~1 s once ≥ 2 s of audio is buffered; hard ceiling 30 s. Stable-prefix trims, silence-trims (2 blank strides), and force-trims (window > 12 s, no stable prefix) all emit `WindowTrimmed`. Every raw transcript passes an 8-step post-processing pipeline (filler removal → stutter collapse → phrase dedup → spurious-period removal → leading-dot strip → leading-punct strip → multi-dot normalisation → missing sentence-space repair → sentence-boundary capitalisation) before emission.
+**`InferenceRepository` sliding window:** partials fire every ~1 s once ≥ 2 s of audio is buffered; hard ceiling 30 s. Stable-prefix trims, silence-trims (2 blank strides), and force-trims (window > 12 s, no stable prefix) all emit `WindowTrimmed`. Every raw transcript passes an 8-step post-processing pipeline (filler removal → stutter collapse → phrase dedup → spurious-period removal → leading-dot strip → leading-punct strip → multi-dot normalisation → missing sentence-space repair → sentence-boundary capitalisation) before emission. **Short utterances** (< 2.5 s) use a decode-context retry at final flush: the TDT decoder is extremely context-sensitive on short clips, so the primary attempt re-decodes from frame 0 with 600 ms of lead silence prepended, and a low-confidence/blank result retries once without the lead; the best non-empty attempt wins, and a "Low confidence" failure is emitted only when a non-blank result fails the 0.55 gate in every context.
 
 **VAD is dual-layer:** `SileroVadFilter` (Silero v4 ONNX) is primary; `RMSVadFilter` (energy threshold) is the automatic fallback if the ONNX VAD model fails to load.
 
@@ -53,8 +53,9 @@ All source lives under `app/src/main/kotlin/` (package root `dev.brgr.outspoke`)
 - Language packs (dictionary + ARPA language model) are downloaded on demand from `https://github.com/minburg/outspoke-data` — the only external URL used at runtime beyond the one-time ASR model download from Hugging Face. Files are pinned to a specific release tag to prevent silent breakage.
 - Supported languages: Bulgarian, Croatian, Czech, Danish, Dutch, English, Estonian, Finnish, French, German, Greek, Hungarian, Italian, Latvian, Lithuanian, Maltese, Polish, Portuguese, Romanian, Russian, Slovak, Slovenian, Spanish, Swedish, Ukrainian (`SuggestionLanguage` enum).
 - `SuggestionFileManager` stores packs in `<filesDir>/suggestion_files/<tag>/`; `SuggestionFileDownloader` handles resumable HTTP downloads with SHA-256 verification.
-- `WordCorrector` orchestrates the pipeline: `CandidateGenerator` (phonetic index via Kölner Phonetik for DE, Double Metaphone for all others + Damerau-Levenshtein edit distance) → `ArpaLanguageModel` (bigram ARPA LM) → combined frequency + LM score.
-- `WordSuggestionProvider` is the public façade used by the IME; it loads only languages selected by the user and delivers results on the main thread.
+- **Acoustic-first candidates:** at decode time `ParakeetEngine` captures the top-3 runner-up tokens per emission (the logits are already in memory) and, for low-confidence words (< 0.6, capped at 3 per chunk), runs a bounded local beam over the word's frame range. `InferenceRepository` segments emissions into words and writes the per-word alternatives (word + length-normalised acoustic log-prob) to a bounded, per-session `AcousticCandidateCache` (`inference/AcousticCandidates.kt`).
+- `WordCorrector` rescores the acoustic alternatives in the log domain: `score = acousticLogProb + λ·ln(10)·lmLog10(candidate | context)` (λ = 0.5; the acoustic term dominates). Because the TDT decoder is lexicon-unconstrained (its beam can emit acoustically plausible strings that are not words), acoustic alternatives are first **filtered to genuine dictionary words** (case-insensitive, deduplicated case-insensitively — `CandidateGenerator.isKnownWord`). The dictionary (`CandidateGenerator`: phonetic index via Kölner Phonetik for DE / Double Metaphone otherwise + Damerau-Levenshtein edit distance) is a low-prior fallback (fixed prior -2.0) when a word has no usable acoustic evidence (none, or all filtered out as non-words). `ArpaLanguageModel` scores with standard ARPA backoff (trigram → bigram → unigram, raw log10).
+- `WordSuggestionProvider` is the public façade used by the IME; its `acousticLookup` is wired to the `InferenceRepository` by `OutspokeInputMethodService`; it loads only languages selected by the user and delivers results on the main thread.
 - The feature is **opt-in** — disabled by default (`suggestionBarEnabled = false`). No data leaves the device once files are downloaded.
 
 ## Adding a New Model
@@ -158,19 +159,11 @@ git tag v0.x.y
 git push origin v0.x.y
 ```
 
-### 6. Create the GitHub Release
+### 6. The GitHub Release is created automatically
 
-1. Go to **Releases → Draft a new release** on GitHub.
-2. Select the tag you just pushed (`v0.x.y`).
-3. Set the release title to `v0.x.y`.
-4. Paste the changelog text (from the `.txt` file above) into the description.
-5. Build the release APKs locally:
-   ```bash
-   ./gradlew assembleRelease
-   # APKs appear in app/build/outputs/apk/release/
-   ```
-6. Attach all three APK files: `arm64-v8a`, `armeabi-v7a`, and `universal`.
-7. Publish the release.
+Pushing the tag triggers the release job in `.github/workflows/release-f-droid.yml`: it decodes the release keystore from repo secrets (never in the source tree), builds the signed release APKs, renames them to `outspoke-<version>.apk` / `outspoke-<version>-<abi>.apk`, writes a `.sha256` checksum next to each, and creates the GitHub Release with all of them attached (release notes are auto-generated from the commits since the previous tag).
+
+Watch the workflow run on the tag push and confirm it ends green. No local build or manual APK attachment is needed.
 
 ### 7. IzzyOnDroid picks it up automatically
 

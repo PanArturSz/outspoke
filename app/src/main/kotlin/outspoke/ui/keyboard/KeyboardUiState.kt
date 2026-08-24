@@ -22,6 +22,13 @@ sealed class KeyboardUiState {
     object Transcribing : KeyboardUiState()
 
     /**
+     * The model detected audio but could not resolve a word (e.g. a short utterance whose
+     * high-frequency fricatives were too weak). No text was committed; the UI shows a brief
+     * "didn't catch that" cue. The talk button stays active so the user can retry.
+     */
+    object NoSpeech : KeyboardUiState()
+
+    /**
      * Something went wrong. [reason] identifies the failure for localized display;
      * [detail] carries an optional technical detail (e.g. exception message) for
      * additional context.

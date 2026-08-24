@@ -23,6 +23,7 @@ import dev.brgr.outspoke.audio.PermissionHelper
 import dev.brgr.outspoke.inference.InferenceService
 import dev.brgr.outspoke.settings.model.ModelStorageManager
 import dev.brgr.outspoke.settings.screens.HomeScreen
+import dev.brgr.outspoke.settings.screens.MicCalibrationScreen
 import dev.brgr.outspoke.settings.screens.ModelScreen
 import dev.brgr.outspoke.settings.screens.PreferencesScreen
 import dev.brgr.outspoke.ui.theme.MyIcons
@@ -52,6 +53,7 @@ object SettingsRoutes {
     const val HOME = "home"
     const val MODEL = "model"
     const val PREFERENCES = "preferences"
+    const val CALIBRATION = "calibration"
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -111,7 +113,12 @@ private fun SettingsNavHost(navController: NavHostController) {
                 ModelScreen()
             }
             composable(route = SettingsRoutes.PREFERENCES) {
-                PreferencesScreen()
+                PreferencesScreen(
+                    onNavigateToCalibration = { navController.navigate(SettingsRoutes.CALIBRATION) },
+                )
+            }
+            composable(route = SettingsRoutes.CALIBRATION) {
+                MicCalibrationScreen()
             }
         }
     }

@@ -21,7 +21,9 @@ private const val TAG = "SileroVadFilter"
  */
 class SileroVadFilter(
     modelBytes: ByteArray,
-    private val threshold: Float = 0.3f
+    private val threshold: Float = 0.3f,
+    private val leadInFrames: Int = LEAD_IN_FRAMES,
+    private val onsetFrames: Int = ONSET_FRAMES,
 ) : VadFilter {
 
     private enum class State { SILENCE, SPEECH }
@@ -37,7 +39,7 @@ class SileroVadFilter(
     private var onsetCount = 0
     private var hangoverFrames = 0
     private var consecutiveSilenceFrames = 0
-    private val leadIn = ArrayDeque<AudioChunk>(LEAD_IN_FRAMES + 1)
+    private val leadIn = ArrayDeque<AudioChunk>(leadInFrames + 1)
 
     override val isSpeechActive: Boolean get() = state == State.SPEECH
 
@@ -113,12 +115,12 @@ class SileroVadFilter(
     private fun applySmoothing(chunk: AudioChunk, prob: Float): List<AudioChunk> {
         return when (state) {
             State.SILENCE -> {
-                if (leadIn.size >= LEAD_IN_FRAMES) leadIn.removeFirst()
+                if (leadIn.size >= leadInFrames) leadIn.removeFirst()
                 leadIn.addLast(chunk)
 
                 if (prob >= threshold) {
                     onsetCount++
-                    if (onsetCount >= ONSET_FRAMES) {
+                    if (onsetCount >= onsetFrames) {
                         state = State.SPEECH
                         onsetCount = 0
                         hangoverFrames = 0

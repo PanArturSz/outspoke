@@ -73,9 +73,11 @@ class InferenceRepositoryPipelineTest {
      */
     @Test
     fun `window trim fires after stable prefix exceeds TRIGGER_WINDOW`() = runTest {
+        // No terminal punctuation: SENTENCE_FINAL must not fire so the regular
+        // stable-chunk trim is what this test exercises.
         val stableText = TranscriptResult.Final(
-            "Ich bin relativ sicher, dass es jetzt besser ist. " +
-                    "Und was ich wirklich nicht haben möchte, ist, dass hier Sätze verloren gehen."
+            "Ich bin relativ sicher, dass es jetzt besser ist " +
+                    "Und was ich wirklich nicht haben möchte, ist, dass hier Sätze verloren gehen"
         )
         val engine = FakeSpeechEngine(List(12) { stableText })
         val repo = InferenceRepository(engine)

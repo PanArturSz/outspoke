@@ -149,6 +149,13 @@ class OutspokeInputMethodService :
         }
 
         wordSuggestionProvider = WordSuggestionProvider(this)
+        // Wire the correction layer to the ASR model's acoustic alternatives: the lookup
+        // reads the currently bound InferenceRepository's acoustic cache (populated at
+        // decode time). Returns empty when no repository is bound (engine not ready) so
+        // the corrector falls back to dictionary candidates.
+        wordSuggestionProvider.acousticLookup = { word ->
+            inferenceBinder?.getRepository()?.getAcousticAlternatives(word) ?: emptyList()
+        }
 
         keyboardViewModel = ViewModelProvider(
             this,
@@ -511,12 +518,26 @@ class OutspokeInputMethodService :
                 connection,
                 attribute ?: EditorInfo(),
                 // Display-clean with the user's current language so the field gets the same
-                // language-aware cleaning the stable-chunk tracking path uses (filler
-                // removal, number normalisation, and spurious-period handling). Reading the
+                // language-aware cleaning the repository's partial/final cleaning uses
+                // (filler removal, number normalisation, structural). Reading the
                 // StateFlow snapshot here is safe — currentLanguage is collected eagerly and
                 // always has a value.
-                displayCleanFn = { text ->
-                    text.cleanTranscript(language = keyboardViewModel.currentLanguage.value)
+                //
+                // isSentenceStart tells the cleaner whether the chunk head begins a
+                // sentence: without it every frozen chunk / composing span would be
+                // capitalised mid-sentence (the cleaner capitalises its first word).
+                //
+                // skipSpuriousPeriods: the spurious-period filter already ran on the FULL
+                // transcript in the repository (partial + final). Re-running it here on a
+                // frozen substring would misfire on the substring's first segment (the tail
+                // of a longer sentence) and delete a genuine sentence-final period, so it
+                // is skipped — the authoritative full-text periods are preserved.
+                displayCleanFn = { text, isSentenceStart ->
+                    text.cleanTranscript(
+                        isContinuation = !isSentenceStart,
+                        language = keyboardViewModel.currentLanguage.value,
+                        skipSpuriousPeriods = true,
+                    )
                 },
             )
         )

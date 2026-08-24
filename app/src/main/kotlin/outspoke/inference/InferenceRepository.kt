@@ -1,5 +1,6 @@
 package dev.brgr.outspoke.inference
 
+import ai.onnxruntime.OnnxTensor
 import android.util.Log
 import dev.brgr.outspoke.audio.AudioChunk
 import kotlinx.coroutines.Dispatchers
@@ -8,6 +9,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.takeWhile
 import java.util.Locale
 import kotlin.collections.ArrayDeque
 import kotlin.collections.List
@@ -157,6 +159,7 @@ private fun TranscriptResult.logLabel(): String = when (this) {
     is TranscriptResult.Final -> "Final(\"${text}\")"
     is TranscriptResult.Failure -> "Failure(${cause.message})"
     is TranscriptResult.WindowTrimmed -> "WindowTrimmed"
+    is TranscriptResult.NoSpeech -> "NoSpeech"
 }
 
 /**
@@ -211,7 +214,7 @@ internal fun String.collapseRepeatedPhrases(): String {
                 val total = (j - i) / len
                 result.addAll(phrase)
                 if (total > 1) {
-                    Log.d(TAG, "[DEDUP] \"${phrase.joinToString(" ")}\" ×$total → kept 1")
+                    Log.d(TAG, "[DEDUP] phrase ×$total → kept 1")
                 }
                 i = j
                 foundRepeat = true
@@ -263,7 +266,7 @@ internal fun String.collapseStutters(): String {
         if (count >= 3) {
             // Keep only 1
             result.add(currentWord)
-            Log.d(TAG, "[STUTTER] \"$currentWord\" ×$count → kept 1")
+            Log.d(TAG, "[STUTTER] collapsed $count repeats → kept 1")
         } else if (count == 2) {
             // Keep both
             result.add(words[i])
@@ -415,7 +418,7 @@ internal fun String.filterSpuriousPeriods(language: String = "en"): String {
         if (lowercaseNextFirstLetter && lowerCaseFixEnabled) {
             val fixed = lowercaseFirstIfMidSentence(word)
             if (fixed != word) {
-                Log.d(TAG, "[CLEAN:SPURIOUS_PERIOD] lower-cased \"$word\" → \"$fixed\" after removed period")
+                Log.d(TAG, "[CLEAN:SPURIOUS_PERIOD] lower-cased word after removed period")
                 word = fixed
             }
         }
@@ -448,7 +451,7 @@ internal fun String.filterSpuriousPeriods(language: String = "en"): String {
                 isNonClosingWord -> "non-closing word"
                 else -> "short segment ($segmentWordCount words)"
             }
-            Log.d(TAG, "[CLEAN:SPURIOUS_PERIOD] removed period after \"$base\" ($reason)")
+            Log.d(TAG, "[CLEAN:SPURIOUS_PERIOD] removed period after a word ($reason)")
             // Emit the word without its trailing period.
             // base.isEmpty() is unreachable in practice (a word that is just "." would be
             // filtered by hasPeriod's !word.endsWith("..") check and normalised away
@@ -648,28 +651,28 @@ internal fun String.cleanTranscriptStructural(
     val input = trim()
 
     val afterLeadDots = input.replace(LEADING_DOTS_RE, "")
-    if (afterLeadDots != input) Log.d(TAG, "[CLEAN:LEAD_DOTS]   \"$input\" → \"$afterLeadDots\"")
+    if (afterLeadDots != input) Log.d(TAG, "[CLEAN:LEAD_DOTS]   ${input.length} → ${afterLeadDots.length} chars")
 
     val afterLeadPunct = afterLeadDots.replace(LEADING_PUNCT_RE, "")
-    if (afterLeadPunct != afterLeadDots) Log.d(TAG, "[CLEAN:LEAD_PUNCT]  \"$afterLeadDots\" → \"$afterLeadPunct\"")
+    if (afterLeadPunct != afterLeadDots) Log.d(TAG, "[CLEAN:LEAD_PUNCT]  ${afterLeadDots.length} → ${afterLeadPunct.length} chars")
 
     val afterTrailDots = afterLeadPunct.replace(TRAILING_DOTS_RE, ".")
-    if (afterTrailDots != afterLeadPunct) Log.d(TAG, "[CLEAN:TRAIL_DOTS]  \"$afterLeadPunct\" → \"$afterTrailDots\"")
+    if (afterTrailDots != afterLeadPunct) Log.d(TAG, "[CLEAN:TRAIL_DOTS]  ${afterLeadPunct.length} → ${afterTrailDots.length} chars")
 
     val afterSentSpace = afterTrailDots.replace(MISSING_SENTENCE_SPACE_RE, "$1 $2").trim()
     if (afterSentSpace != afterTrailDots.trim()) Log.d(
         TAG,
-        "[CLEAN:SENT_SPACE]  \"${afterTrailDots.trim()}\" → \"$afterSentSpace\""
+        "[CLEAN:SENT_SPACE]  ${afterTrailDots.trim().length} → ${afterSentSpace.length} chars"
     )
 
     val afterCaps = afterSentSpace.applySentenceCapitalization(
         skipInitialCapitalize = isContinuation,
         modelFirstWord = modelFirstWord,
     )
-    if (afterCaps != afterSentSpace) Log.d(TAG, "[CLEAN:CAPITALIZE]  \"$afterSentSpace\" → \"$afterCaps\"")
+    if (afterCaps != afterSentSpace) Log.d(TAG, "[CLEAN:CAPITALIZE]  ${afterSentSpace.length} → ${afterCaps.length} chars")
 
     return if (afterCaps.none { it.isLetterOrDigit() }) {
-        Log.d(TAG, "[CLEAN] \"$input\" → discarded (no alphanumeric content)")
+        Log.d(TAG, "[CLEAN] ${input.length} chars → discarded (no alphanumeric content)")
         ""
     } else {
         afterCaps
@@ -688,11 +691,21 @@ internal fun String.cleanTranscriptStructural(
  *
  * @param isContinuation Passed through to [cleanTranscriptStructural] to suppress
  *   initial-letter capitalisation after an audio window trim.
+ * @param skipSpuriousPeriods When `true`, the [filterSpuriousPeriods] step is skipped.
+ *   The spurious-period filter is a one-shot transform on the model's raw output: its
+ *   short-segment heuristic relies on the word count since the previous period, which is
+ *   only complete on the full transcript. Re-running it on a frozen substring (the
+ *   display re-clean in [TextInjector]) would misfire on the substring's first segment —
+ *   the tail of a longer sentence — and delete a genuine sentence-final period. Callers
+ *   that re-clean text already cleaned from the full transcript (the production
+ *   displayCleanFn) must set this to `true` so the authoritative full-text periods are
+ *   preserved.
  */
 internal fun String.cleanTranscript(
     isContinuation: Boolean = false,
     language: String = "en",
     formatNumbersAsDigits: Boolean = true,
+    skipSpuriousPeriods: Boolean = false,
 ): String {
     if (isBlank()) {
         Log.d(TAG, "[CLEAN] blank input → discarded")
@@ -710,29 +723,34 @@ internal fun String.cleanTranscript(
     val modelFirstWord = firstWordLowercased(input)
 
     val afterFillers = input.removeFillerWords(language)
-    if (afterFillers != input) Log.d(TAG, "[CLEAN:FILLERS]     \"$input\" → \"$afterFillers\"")
+    if (afterFillers != input) Log.d(TAG, "[CLEAN:FILLERS]     ${input.length} → ${afterFillers.length} chars")
 
     val afterStutters = afterFillers.collapseStutters()
-    if (afterStutters != afterFillers) Log.d(TAG, "[CLEAN:STUTTER]     \"$afterFillers\" → \"$afterStutters\"")
+    if (afterStutters != afterFillers) Log.d(TAG, "[CLEAN:STUTTER]     ${afterFillers.length} → ${afterStutters.length} chars")
 
     val afterNumbers = if (formatNumbersAsDigits) {
         val words = afterStutters.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
         val normalised = NumberNormaliser.normalise(words, language)
         val joined = normalised.joinToString(" ")
-        if (joined != afterStutters) Log.d(TAG, "[CLEAN:NUMBERS]     \"$afterStutters\" → \"$joined\"")
+        if (joined != afterStutters) Log.d(TAG, "[CLEAN:NUMBERS]     ${afterStutters.length} → ${joined.length} chars")
         joined
     } else {
         afterStutters
     }
 
     val afterDedup = afterNumbers.collapseRepeatedPhrases()
-    if (afterDedup != afterStutters) Log.d(TAG, "[CLEAN:PHRASES]     \"$afterStutters\" → \"$afterDedup\"")
+    if (afterDedup != afterStutters) Log.d(TAG, "[CLEAN:PHRASES]     ${afterStutters.length} → ${afterDedup.length} chars")
 
-    val afterSpuriousPeriods = afterDedup.filterSpuriousPeriods(language)
-    if (afterSpuriousPeriods != afterDedup) Log.d(
-        TAG,
-        "[CLEAN:SPURIOUS_P]  \"$afterDedup\" → \"$afterSpuriousPeriods\""
-    )
+    val afterSpuriousPeriods = if (skipSpuriousPeriods) {
+        afterDedup
+    } else {
+        val filtered = afterDedup.filterSpuriousPeriods(language)
+        if (filtered != afterDedup) Log.d(
+            TAG,
+            "[CLEAN:SPURIOUS_P]  \"$afterDedup\" → \"$filtered\""
+        )
+        filtered
+    }
 
     return afterSpuriousPeriods.cleanTranscriptStructural(isContinuation, modelFirstWord)
 }
@@ -762,18 +780,100 @@ private const val SHORT_UTTERANCE_THRESHOLD_SAMPLES = (SAMPLE_RATE * 2.5f).toInt
 /**
  * Minimum sample count passed to the engine on the short-utterance path.
  *
- * The encoder needs at least 2 s of frames to reliably produce tokens; anything
- * shorter causes the TDT decoder to return blank or hallucinate. Zero-padding
- * ([ShortArray.copyOf] fills new positions with 0) is decoded as silence — the TDT
- * decoder advances through blank frames at the tail without emitting speech tokens.
+ * 1.25 s matches the reference NeMo pipeline (which pads < 1 s clips to 1.25 s).
+ * Zero-padding ([ShortArray.copyOf] fills new positions with 0) is decoded as silence —
+ * the TDT decoder advances through blank frames at the tail without emitting speech tokens.
+ *
+ * NOTE: this was 2 s. Real-model experiments showed the longer pad actively breaks
+ * single-word utterances: "no" (0.5 s) decodes as `No` when padded to 1.25 s but returns
+ * blank when padded to 2 s; "yes" (0.7 s) decodes as `Yes` at 1.25 s with the VAD's
+ * 600 ms lead-in but never at 2 s. The extra trailing silence pushes the TDT decoder's
+ * blank-run past the token boundary instead of anchoring it.
  */
-private const val MIN_PADDING_SAMPLES = SAMPLE_RATE * 2  // 2 s = 32 000 samples
+private const val MIN_PADDING_SAMPLES = SAMPLE_RATE * 5 / 4  // 1.25 s = 20 000 samples
+
+/**
+ * Leading silence prepended to short-utterance decodes (600 ms = 9 600 samples).
+ *
+ * Real-model probes show the TDT decoder is extremely context-sensitive on short
+ * clips: 600 ms of leading silence (matching the Silero VAD lead-in) flips blank
+ * decodes into correct words ("Yes" decodes blank without it, correctly with it),
+ * while trailing digital silence is the harmful direction (a 1 s zero tail makes
+ * "No" decode blank). The VAD's own lead-in already provides up to 600 ms when the
+ * user pauses before speaking, but a user who starts talking right after pressing
+ * the talk button gives the buffer little or none — so the short-utterance decode
+ * always prepends this silence.
+ */
+private const val SHORT_UTT_LEAD_SILENCE_SAMPLES = SAMPLE_RATE * 60 / 100  // 600 ms = 9 600 samples
 
 /** Emit a fresh partial inference every time this many new samples arrive (1 s). */
 private const val STRIDE_SAMPLES = SAMPLE_RATE            // 1 s = 16 000 samples
 
 /** Maximum audio context kept in the rolling window (30 s). */
 private const val MAX_WINDOW_SAMPLES = SAMPLE_RATE * 30   // 30 s = 480 000 samples
+
+// ── Chunked-TDT streaming parameters ────────────────────────────────────────────────
+// The streaming path processes audio in fixed [CHUNK_SAMPLES] strides. For each chunk the
+// encoder is run on a [LEFT_CONTEXT | chunk | RIGHT_CONTEXT] buffer (the Conformer is
+// bidirectional, so the right context improves the chunk's encoder features), and only the
+// chunk's frames are decoded, carrying the TDT decoder state from the previous chunk. This
+// yields offline-equivalent accuracy with no re-emission or duplication. Measured by
+// StreamingParityTest (18 real fixtures): the frozen field text is byte-identical to the
+// one-shot final (WER 0.0), and the residual delta vs the one-shot reference is the model's
+// 2 s-context approximation (worst fixture 1 word / 34 ≈ 0.03). Latency to the first
+// committed chunk is CHUNK + RIGHT (≈ 4 s); each subsequent chunk commits RIGHT after it ends.
+
+/** Size of each processed chunk (2 s). */
+private const val CHUNK_SAMPLES = SAMPLE_RATE * 2            // 2 s = 32 000 samples
+
+/** Lookahead (right context) required before a chunk is decoded (2 s). */
+private const val RIGHT_CONTEXT_SAMPLES = SAMPLE_RATE * 2    // 2 s = 32 000 samples
+
+/** Trailing (left) context kept before each chunk for encoder anchoring (2 s). */
+private const val LEFT_CONTEXT_SAMPLES = SAMPLE_RATE * 2     // 2 s = 32 000 samples
+
+// ── Acoustic word-alternative capture (word-correction overhaul) ──────────────────────
+// Per-word confidence below which the bounded local beam runs. Words above the gate are
+// ones the model is confident about (correction unlikely) and skip the beam entirely —
+// the common case, so the added decode cost is near zero.
+private const val ACUSTIC_CONF_GATE = 0.6f
+
+// Maximum local beams per decoded chunk, so a pathological chunk (many low-confidence
+// words) cannot blow up decode time.
+private const val MAX_BEAMS_PER_CHUNK = 3
+
+// Frames of slack past a word's last token that the local beam may search — a genuine
+// alternative word can be slightly longer (more frames) than the emitted one.
+private const val BEAM_FRAME_MARGIN = 2
+
+// Number of acoustic alternatives kept per word in the cache (the correction layer
+// rescores these with the LM and returns the top 5 to the UI).
+private const val MAX_CACHED_ALTERNATIVES = 5
+
+/**
+ * A plausible single-word candidate for the suggestion bar: at least 2 characters, no
+ * internal whitespace (the beam can occasionally emit a two-word fragment), and at least
+ * one letter (drops pure-digit / pure-punctuation detokenisation artefacts).
+ */
+private fun isValidCandidateWord(w: String): Boolean =
+    w.length >= 2 && !w.contains(' ') && w.any { it.isLetter() }
+
+/**
+ * Deterministic encoder frame offset for a sample position.
+ *
+ * The nemo128 preprocessor emits one feature frame per 160 samples (10 ms hop) plus one
+ * padding frame; the encoder subsamples by 8 (ceiling). So the encoder frame index
+ * corresponding to sample position [n] is `(n / 160 + 1) / 8`. Verified empirically
+ * against the int8 ONNX export (frame counts are deterministic given the input length,
+ * even though the frame *values* are non-causal).
+ *
+ * **This is a position→frame map, NOT a total frame count.** For a buffer of length [n]
+ * the encoder produces `ceil((n/160 + 1)/8)` frames, which is one MORE than
+ * [frameOffset](n) for most [n] (floor vs ceiling). Use the encoder's actual length
+ * output ([ParakeetEngine.encodeBuffer]'s second component) as the frame end when
+ * decoding a whole buffer — see [decodeChunkRange].
+ */
+private fun frameOffset(n: Int): Int = (n / 160 + 1) / 8
 
 /**
  * When consecutive strides all diverge (no common prefix at all), the window can grow
@@ -881,17 +981,31 @@ private fun ShortArray.rms(): Float {
 }
 
 /**
- * Scans [window] chunk boundaries for a VAD-quiet (low-energy) cut point within
- * [[minDrop], [maxDrop]], anchored to [targetDrop].
+ * Maximum distance from [targetDrop] that [findSilenceCutPoint] will search for a
+ * low-energy cut point (1.5 s).
+ *
+ * The proportional word→time estimate is biased: pauses inside the stable region and
+ * still-decoding tail words make it land before the true stable boundary. Bounding the
+ * search to a band around the estimate lets the cut snap forward to the real pause
+ * (the usual case) without latching onto an unrelated silence seconds away — which
+ * would discard anchor context the next partial still needs to re-emit the tail words
+ * that [dev.brgr.outspoke.ime.TextInjector] drops from the composing span on trim.
+ */
+private const val SILENCE_CUT_SEARCH_RADIUS_SAMPLES = SAMPLE_RATE * 3 / 2  // 1.5 s = 24 000 samples
+
+/**
+ * Scans [window] chunk boundaries for a VAD-quiet (low-energy) cut point near
+ * [targetDrop], restricted to the band
+ * `[max(minDrop, targetDrop − radius), min(maxDrop, targetDrop + radius)]`.
  *
  * Priority:
  *  1. Latest silence at or before [targetDrop] — ensures we never slice into the speech
  *     that immediately follows the stable-text boundary.
- *  2. Earliest silence after [targetDrop] up to [maxDrop] — secondary fallback when no
+ *  2. Earliest silence after [targetDrop] within the band — secondary fallback when no
  *     silence precedes the target; trimming a little past the estimate is still better
  *     than cutting mid-phoneme.
  *  3. [targetDrop] itself — proportional estimate used verbatim only when no silence at
- *     all is found in the valid range.
+ *     all is found in the band.
  *
  * Cutting at a silence boundary prevents slicing an active phoneme and eliminates the
  * hallucinations Parakeet produces when its window starts mid-consonant.
@@ -903,14 +1017,16 @@ private fun findSilenceCutPoint(
     maxDrop: Int,
 ): Int {
     val silenceThreshold = 0.02f
+    val searchStart = maxOf(minDrop, targetDrop - SILENCE_CUT_SEARCH_RADIUS_SAMPLES)
+    val searchEnd = minOf(maxDrop, targetDrop + SILENCE_CUT_SEARCH_RADIUS_SAMPLES)
     var cumulative = 0
     var lastSilenceBeforeTarget = -1
     var firstSilenceAfterTarget = -1
 
     for (chunk in window) {
         cumulative += chunk.size
-        if (cumulative < minDrop) continue
-        if (cumulative > maxDrop) break
+        if (cumulative < searchStart) continue
+        if (cumulative > searchEnd) break
         val rms = chunk.rms()
         if (rms < silenceThreshold) {
             if (cumulative <= targetDrop) {
@@ -922,8 +1038,8 @@ private fun findSilenceCutPoint(
     }
 
     return when {
-        lastSilenceBeforeTarget >= minDrop -> lastSilenceBeforeTarget
-        firstSilenceAfterTarget in minDrop..maxDrop -> firstSilenceAfterTarget
+        lastSilenceBeforeTarget >= searchStart -> lastSilenceBeforeTarget
+        firstSilenceAfterTarget in searchStart..searchEnd -> firstSilenceAfterTarget
         else -> targetDrop
     }
 }
@@ -985,38 +1101,39 @@ internal const val CONFIDENCE_THRESHOLD = 0.55f
 /**
  * Estimates a 0.0–1.0 confidence score for a short-utterance [TranscriptResult].
  *
- * **Confidence metric used: word-character count proxy**
+ * **Confidence metric: engine per-token confidence with a plausibility floor**
  *
- * The current Parakeet TDT ONNX pipeline (`greedyDecode`) returns only the final text
- * string — individual token log-probabilities are discarded after the argmax step inside
- * the decoder loop and are never surfaced through `transcribe()`.  Extracting true
- * per-token probabilities would require:
- *   1. Running `softmax` over the 8 198-dim joint logit vector at each decoder step.
- *   2. Accumulating `log(softmax[argmax_token])` across all non-blank emissions.
- *   3. Returning those log-probs alongside the text (new return type / wrapper class).
+ * The score is the engine's real per-token geometric-mean probability
+ * ([TranscriptResult.Final.confidence] / [TranscriptResult.Partial.confidence]) —
+ * `exp(mean(log_softmax(argmax)))` over all non-blank emissions, computed inside
+ * `ParakeetEngine.greedyDecode`. Low values flag hallucinations: on noise, silence,
+ * or cold strides the TDT decoder emits tokens with flat (uncertain) distributions,
+ * whereas real speech produces confidently peaked ones.
  *
- * Until that refactor is done we use a conservative text-length proxy:
- *   - If [result] is not a [TranscriptResult.Final] or [TranscriptResult.Partial],
- *     confidence = 0.0 (unknown/failure — always gate).
- *   - If the cleaned text contains **fewer than 2 word characters** (letters or digits)
- *     after stripping punctuation and whitespace, confidence = 0.0.
- *     This catches the common hallucination patterns on very short/silent clips:
- *     empty string, a lone period, a single letter, or a lone digit.
- *   - Otherwise confidence = 1.0 — at least two real characters were decoded, which
- *     represents a plausible word fragment or a complete short word.
+ * A plausibility floor is applied first: results with **fewer than 2 word characters**
+ * (letters or digits) after stripping punctuation and whitespace score 0.0 regardless
+ * of the engine's confidence. This catches the common hallucination patterns on very
+ * short/silent clips — empty string, a lone period, a single letter, or a lone digit —
+ * which the model can (and does) emit with high token confidence.
  *
- * The [audioSamples] parameter is accepted for API symmetry and future use (e.g. a
- * density ratio once per-token log-probs become available), but is not used in this
- * implementation.
+ * Non [Final]/[Partial] results (Failure, WindowTrimmed) score 0.0.
  *
  * @param result The cleaned [TranscriptResult] from the engine.
- * @param audioSamples Number of actual (pre-padding) audio samples in the utterance.
- *   Not used by the current heuristic but retained for future per-token log-prob upgrade.
  */
-internal fun estimateConfidence(result: TranscriptResult, audioSamples: Int): Float {
-    val text = when (result) {
-        is TranscriptResult.Final -> result.text
-        is TranscriptResult.Partial -> result.text
+internal fun estimateConfidence(result: TranscriptResult): Float {
+    val text: String
+    val engineConfidence: Float
+    when (result) {
+        is TranscriptResult.Final -> {
+            text = result.text
+            engineConfidence = result.confidence
+        }
+
+        is TranscriptResult.Partial -> {
+            text = result.text
+            engineConfidence = result.confidence
+        }
+
         else -> return 0.0f
     }
 
@@ -1028,12 +1145,7 @@ internal fun estimateConfidence(result: TranscriptResult, audioSamples: Int): Fl
     // single letters produced when the encoder sees near-silent padded audio.
     if (wordCharCount < 2) return 0.0f
 
-    // At least 2 real word characters decoded → treat as plausible (confidence = 1.0).
-    // Future upgrade: replace with exp(mean(log_probs)) over non-blank tokens once the
-    // ONNX greedyDecode loop surfaces per-token log-probabilities.
-    @Suppress("UNUSED_PARAMETER")
-    val unused = audioSamples   // retained for future per-token log-prob upgrade
-    return 1.0f
+    return engineConfidence
 }
 
 /**
@@ -1149,6 +1261,16 @@ class InferenceRepository(
 ) {
 
     /**
+     * Bounded cache of per-word acoustic alternatives, populated at decode time by the
+     * Parakeet streaming path (top-K token swaps + bounded local beam over low-confidence
+     * words) and read by the word-correction layer via [getAcousticAlternatives].
+     * Process-local to this repository (the long-lived bound inference service), so it
+     * persists across keyboard hide/show cycles and is cleared at the start of each new
+     * recording session.
+     */
+    val acousticCache: AcousticCandidateCache = AcousticCandidateCache()
+
+    /**
      * Forwards a language tag to the underlying engine.
      * No-op for engines that do not support language selection (Parakeet, Voxtral).
      */
@@ -1159,6 +1281,18 @@ class InferenceRepository(
      * No-op for engines that do not support language selection (Parakeet, Voxtral).
      */
     fun setLanguageConstraints(tags: List<String>) = engine.setLanguageConstraints(tags)
+
+    /**
+     * Returns the cached acoustic alternatives for [word] — the ASR model's own
+     * word-level hypotheses captured at decode time (top-K token swaps and/or a bounded
+     * local beam) — or an empty list when the word has no acoustic evidence (decoded
+     * before capture was active, evicted from the bounded cache, or manually typed).
+     * The word-correction layer rescores these with the language model; an empty result
+     * falls back to dictionary candidates.
+     *
+     * Safe to call from any thread (the IME main / Default threads).
+     */
+    fun getAcousticAlternatives(word: String): List<WordAlternative> = acousticCache.get(word)
 
     /**
      * Applies grammar correction to [result] if it is a [TranscriptResult.Final].
@@ -1175,7 +1309,7 @@ class InferenceRepository(
             is TranscriptResult.Final -> {
                 val corrected = grammarCorrector.correct(result.text, language)
                 if (corrected != result.text) {
-                    Log.d(TAG, "[GRAMMAR] corrected: \"${result.text}\" → \"$corrected\"")
+                    Log.d(TAG, "[GRAMMAR] grammar correction applied")
                     result.copy(text = corrected)
                 } else {
                     result
@@ -1195,6 +1329,552 @@ class InferenceRepository(
         audio: Flow<AudioChunk>,
         postprocessingEnabled: Boolean = true,
         formatNumbersAsDigits: Boolean = true,
+    ): Flow<TranscriptResult> = channelFlow<TranscriptResult> {
+        // The chunked-TDT streaming path requires the Parakeet engine's stateful decode
+        // primitives. If a non-Parakeet engine is configured we fall back to the legacy
+        // whole-window re-transcription path (kept below) so the repository stays functional.
+        val parakeet = engine as? ParakeetEngine
+        if (parakeet == null) {
+            legacyTranscribe(audio, postprocessingEnabled, formatNumbersAsDigits).collect { send(it) }
+            return@channelFlow
+        }
+
+        // Each transcribe() call is a fresh recording session: drop stale acoustic
+        // alternatives from the previous session so the correction layer never rescores
+        // words against evidence from a different utterance.
+        acousticCache.clear()
+
+        // ── Chunked-TDT streaming state ────────────────────────────────────────────────
+        // The audio buffer (growing list of PCM chunks) plus the TDT decoder state. Audio is
+        // processed in fixed [CHUNK_SAMPLES] strides with [RIGHT_CONTEXT_SAMPLES] of lookahead
+        // and [LEFT_CONTEXT_SAMPLES] of trailing context. The TDT decoder state is carried
+        // across chunks so each chunk emits exactly its own new tokens — no re-emission, no
+        // duplication, and offline-equivalent accuracy (see StreamingParityTest for the
+        // measured field-vs-one-shot delta).
+        val buffer = ArrayDeque<ShortArray>()
+        var totalSamples = 0
+        // Absolute sample position of buffer.first() (0 until the front is trimmed). The
+        // buffer is bounded: once a chunk is decoded, audio older than the next chunk's
+        // left-context start is never read again and is trimmed from the front so a long
+        // dictation does not grow the buffer without bound (30 min ≈ 57 MB unbounded).
+        var bufferStart = 0
+        var state = parakeet.initialTdtState()
+        val allTokens = mutableListOf<Int>()
+        var nextChunkStart = 0
+        // Per-utterance confidence accumulators: the sum of per-emission log-softmax
+        // probabilities and the count of non-blank emissions across all decoded chunks.
+        // The utterance confidence is the geometric mean exp(sum / count) — chunking-
+        // independent because log-probs are summed, not averaged.
+        var totalLogProbSum = 0.0
+        var totalEmissions = 0
+        // First ONNX/streaming failure for this utterance, if any. When non-null the
+        // decode loop stops and a single TranscriptResult.Failure is emitted at the end
+        // so an engine error surfaces as a contained result (the IME shows it) instead of
+        // an uncaught exception that the keyboard's catch-all mislabels.
+        var streamFailure: Exception? = null
+        // The last word segment of the most recent decoded chunk, held back because it is
+        // only known to be complete when the next chunk (or the utterance end) arrives —
+        // a word may continue across the chunk boundary. Consumed by
+        // [captureAcousticCandidates] on the next chunk and flushed by [flushAsFinal].
+        var pendingEmissions: List<TokenEmission> = emptyList()
+
+        // Geometric-mean confidence over every non-blank emission this utterance.
+        fun utteranceConfidence(): Float = if (totalEmissions > 0) {
+            Math.exp(totalLogProbSum / totalEmissions).toFloat().coerceIn(0f, 1f)
+        } else 1.0f
+
+        // Trim the buffer front so it keeps only samples from [keepFrom) onward. Audio
+        // before keepFrom is never read again (the next chunk's left context starts there).
+        fun trimBufferFront(keepFrom: Int) {
+            val target = keepFrom.coerceAtLeast(bufferStart)
+            while (buffer.isNotEmpty() && bufferStart < target) {
+                val head = buffer.first()
+                val headEnd = bufferStart + head.size
+                if (headEnd <= target) {
+                    bufferStart = headEnd
+                    buffer.removeFirst()
+                } else {
+                    buffer[0] = head.copyOfRange(target - bufferStart, head.size)
+                    bufferStart = target
+                }
+            }
+        }
+
+        // Extract samples [start, end) (absolute positions) from the buffer, normalised to
+        // [-1, 1]. The buffer may have been front-trimmed, so positions are offset by
+        // [bufferStart]; anything before bufferStart has already been decoded and is
+        // clamped (callers never request it).
+        fun extractRange(start: Int, end: Int): FloatArray {
+            val relStart = (start - bufferStart).coerceAtLeast(0)
+            val relEnd = (end - bufferStart).coerceAtLeast(relStart)
+            val len = relEnd - relStart
+            val out = FloatArray(len)
+            var outPos = 0
+            var cursor = 0
+            for (arr in buffer) {
+                val arrEnd = cursor + arr.size
+                if (arrEnd <= relStart) { cursor = arrEnd; continue }
+                if (cursor >= relEnd) break
+                val from = maxOf(0, relStart - cursor)
+                val to = minOf(arr.size, relEnd - cursor)
+                for (i in from until to) out[outPos++] = arr[i] / 32768f
+                cursor = arrEnd
+            }
+            return out
+        }
+
+        // Records the first streaming failure (subsequent failures are ignored) so the
+        // caller can emit a single contained TranscriptResult.Failure.
+        fun recordStreamFailure(ex: Exception, chunkStart: Int, chunkEnd: Int) {
+            if (streamFailure == null) {
+                Log.e(TAG, "[STREAM] Parakeet decode failed at chunk [$chunkStart,$chunkEnd)", ex)
+                streamFailure = ex
+            }
+        }
+
+        // ── Acoustic word-alternative capture (word-correction overhaul) ────────────────
+        // Top-K token-swap candidates for a completed word: swap each runner-up token into
+        // each position, detokenise, dedupe, keep the best length-normalised log-prob per
+        // resulting word (including the word itself). The logits were in memory at decode
+        // time, so this is near-free.
+        fun tokenSwapCandidates(wordEmissions: List<TokenEmission>): HashMap<String, Double> {
+            val tokenCount = wordEmissions.size
+            val logProbSum = wordEmissions.sumOf { it.logProb }
+            val candidates = HashMap<String, Double>()
+            candidates[parakeet.detokenizeTokens(wordEmissions.map { it.token })] = logProbSum / tokenCount
+            val baseTokens = wordEmissions.map { it.token }.toMutableList()
+            for (i in wordEmissions.indices) {
+                for (alt in wordEmissions[i].topTokens) {
+                    if (alt.token == wordEmissions[i].token) continue
+                    baseTokens[i] = alt.token
+                    val swappedText = parakeet.detokenizeTokens(baseTokens)
+                    baseTokens[i] = wordEmissions[i].token
+                    if (swappedText.isBlank()) continue
+                    val swappedNorm = (logProbSum - wordEmissions[i].logProb + alt.logProb) / tokenCount
+                    if (swappedNorm > candidates.getOrDefault(swappedText, Double.NEGATIVE_INFINITY)) {
+                        candidates[swappedText] = swappedNorm
+                    }
+                }
+            }
+            return candidates
+        }
+
+        // Filters [candidates] to plausible single words (dropping [emittedWord] itself —
+        // the bar replaces it, so suggesting it is pointless) and writes the top
+        // [MAX_CACHED_ALTERNATIVES] to the acoustic cache.
+        fun cacheCandidates(emittedWord: String, candidates: Map<String, Double>) {
+            val emittedKey = emittedWord.lowercase()
+            val alternatives = candidates.entries
+                .filter { (w, _) -> isValidCandidateWord(w) && w.lowercase() != emittedKey }
+                .sortedByDescending { it.value }
+                .take(MAX_CACHED_ALTERNATIVES)
+                .map { (w, lp) -> WordAlternative(w, lp.toFloat()) }
+            if (alternatives.isNotEmpty()) {
+                acousticCache.put(emittedWord, alternatives)
+                Log.d(TAG, "[ACOUSTIC] captured ${alternatives.size} alternative(s)")
+            }
+        }
+
+        // The utterance is over: the pending word (if any) is now complete. Only top-K
+        // token swaps are possible here — the local beam needs the chunk's encoder tensor,
+        // which is already closed.
+        fun flushPendingWordCandidates() {
+            val wordEmissions = pendingEmissions
+            if (wordEmissions.isEmpty()) return
+            pendingEmissions = emptyList()
+            val wordText = parakeet.detokenizeTokens(wordEmissions.map { it.token })
+            if (wordText.isBlank() || wordText.length < 2) return
+            cacheCandidates(wordText, tokenSwapCandidates(wordEmissions))
+        }
+
+        // Captures the ASR model's own word-level alternatives while the chunk's encoder
+        // tensor is still open: top-K token swaps for every completed word (cheap — the
+        // logits were in memory at decode time) and a bounded local beam for
+        // low-confidence words (the quality step, gated + capped). Results are written to
+        // [acousticCache] keyed by the detokenised word and read by the word-correction
+        // layer when the user places the cursor on a word.
+        //
+        // Word segmentation: a SentencePiece word starts at a word-initial token (▁) and
+        // ends at the next word-initial token or the utterance end. The chunk's final
+        // segment is deferred ([pendingEmissions]) — it is only known to be complete when
+        // the next chunk (or the utterance end) arrives, because a word may continue
+        // across the chunk boundary.
+        //
+        // A word is *beamable* only when fully contained in this chunk (its first
+        // token's decoder-state snapshot lives in this chunk's [decoded.stateSnapshots]);
+        // words continued from a previous chunk get token-swap candidates only.
+        fun captureAcousticCandidates(
+            decoded: ParakeetEngine.ChunkDecodeResult,
+            encOut: OnnxTensor,
+            encLen: Int,
+        ) {
+            if (decoded.emissions.isEmpty()) return   // no new tokens; pending stays pending
+
+            // 1. Segment this chunk's emissions into word segments (▁ starts a new word).
+            val segments = ArrayList<List<TokenEmission>>()
+            val current = ArrayList<TokenEmission>()
+            for (em in decoded.emissions) {
+                if (current.isNotEmpty() && parakeet.tokenStartsWord(em.token)) {
+                    segments.add(current.toList())   // copy — [current] is reused below
+                    current.clear()
+                }
+                current.add(em)
+            }
+            if (current.isNotEmpty()) segments.add(current)
+
+            // 2. Resolve which segments complete words and which stay pending.
+            val completed = ArrayList<List<TokenEmission>>()
+            val beamable = ArrayList<Boolean>()
+            val pending = pendingEmissions
+            if (pending.isNotEmpty()) {
+                if (segments.size >= 2) {
+                    completed.add(pending + segments[0])
+                    beamable.add(false)   // continuation — start state is in a previous chunk
+                    for (i in 1 until segments.size - 1) {
+                        completed.add(segments[i])
+                        beamable.add(true)
+                    }
+                    pendingEmissions = segments.last()
+                } else {
+                    pendingEmissions = pending + segments[0]
+                }
+            } else {
+                for (i in 0 until segments.size - 1) {
+                    completed.add(segments[i])
+                    beamable.add(true)
+                }
+                pendingEmissions = segments.last()
+            }
+
+            // 3. Build candidates for each completed word and write them to the cache.
+            var beamsUsed = 0
+            for (idx in completed.indices) {
+                val wordEmissions = completed[idx]
+                val wordText = parakeet.detokenizeTokens(wordEmissions.map { it.token })
+                if (wordText.isBlank() || wordText.length < 2) continue
+                val tokenCount = wordEmissions.size
+                val logProbSum = wordEmissions.sumOf { it.logProb }
+                // Per-word confidence: geometric mean of token probabilities (the same
+                // formula as the utterance confidence). Words below the gate are the ones
+                // the model itself is unsure about — the likely mis-hearings worth
+                // correcting; confident words skip the beam (the common case, zero cost).
+                val confidence = Math.exp(logProbSum / tokenCount).toFloat().coerceIn(0f, 1f)
+
+                // Phase 1 — top-K token swaps (every word, near-free).
+                val candidates = tokenSwapCandidates(wordEmissions)
+
+                // Phase 2 — bounded local beam for low-confidence words (gated + capped):
+                // finds genuine alternative *words* (different token sequences) that
+                // single-token swapping cannot reach. Beam results supersede swap results
+                // for the same word when they score higher.
+                if (beamable[idx] && confidence < ACUSTIC_CONF_GATE && beamsUsed < MAX_BEAMS_PER_CHUNK) {
+                    val firstFrame = wordEmissions.first().frame
+                    val lastFrame = wordEmissions.last().frame
+                    val snapshot = decoded.stateSnapshots.firstOrNull { it.frame == firstFrame }
+                    if (snapshot != null) {
+                        beamsUsed++
+                        val beamEnd = (lastFrame + BEAM_FRAME_MARGIN).coerceAtMost(encLen - 1)
+                        try {
+                            for (alt in parakeet.localWordBeam(encOut, encLen, firstFrame, beamEnd, snapshot)) {
+                                if (alt.acousticLogProb > candidates.getOrDefault(alt.word, Double.NEGATIVE_INFINITY)) {
+                                    candidates[alt.word] = alt.acousticLogProb.toDouble()
+                                }
+                            }
+                        } catch (ex: Exception) {
+                            Log.w(TAG, "[ACOUSTIC] local beam failed", ex)
+                        }
+                    }
+                }
+
+                cacheCandidates(wordText, candidates)
+            }
+        }
+
+        // Decode the chunk [chunkStart, chunkEnd) using [rightEnd) as the right-context limit,
+        // appending its tokens to [allTokens] and updating [state].
+        fun decodeChunkRange(chunkStart: Int, chunkEnd: Int, rightEnd: Int) {
+            if (streamFailure != null) return
+            val bufStart = maxOf(0, chunkStart - LEFT_CONTEXT_SAMPLES)
+            val bufEnd = minOf(rightEnd, totalSamples)
+            if (bufEnd <= bufStart) return
+            val (encOut, encLen) = try {
+                parakeet.encodeBuffer(extractRange(bufStart, bufEnd))
+            } catch (ex: Exception) {
+                recordStreamFailure(ex, chunkStart, chunkEnd)
+                return
+            }
+            try {
+                // The nominal chunk start, shifted by the previous chunk's frameDelta: a
+                // positive delta means the TDT duration jump at the previous boundary
+                // skipped frames past the nominal start (the one-shot decoder never
+                // visits them — decoding them here would emit phantom tokens); a negative
+                // delta resumes a few frames early after a safety-cap termination.
+                val fL = (frameOffset(chunkStart - bufStart) + state.frameDelta).coerceIn(0, encLen)
+                // Frame end: when the chunk extends to the end of the encoded buffer (no
+                // right context beyond it — the short-utterance flush's final chunk), the
+                // end must be the true encoder frame count [encLen]. [frameOffset] is a
+                // position→frame map, not a total count: it underestimates the frame count
+                // for a buffer of length n by 1 for most n (floor vs the encoder's ceiling
+                // subsample), so using it here would drop the last encoder frame — the tail
+                // of the word. For interior chunks (streaming, with right context) the
+                // position map correctly selects the chunk's end frame within the buffer.
+                val chunkReachesBufferEnd = (chunkEnd - bufStart) >= (bufEnd - bufStart)
+                val fLC = if (chunkReachesBufferEnd) encLen else minOf(frameOffset(chunkEnd - bufStart), encLen)
+                val decoded = parakeet.decodeChunk(
+                    encOut, encLen, fL, if (fLC <= fL) encLen else fLC, state
+                )
+                state = decoded.state
+                allTokens += decoded.tokens
+                totalLogProbSum += decoded.logProbSum
+                totalEmissions += decoded.emissionCount
+                // Capture acoustic word alternatives while the encoder tensor is open.
+                captureAcousticCandidates(decoded, encOut, encLen)
+            } catch (ex: Exception) {
+                recordStreamFailure(ex, chunkStart, chunkEnd)
+            } finally {
+                encOut.close()
+            }
+        }
+
+        // Emit the current merged text as a Partial (fully cleaned + hallucination-checked).
+        //
+        // The partial is cleaned with the SAME full pipeline as the final (filler removal,
+        // stutter collapse, number normalisation, phrase dedup, spurious-period filter,
+        // structural). This is safe here because the Parakeet path's tokens are append-only
+        // (each token is emitted once and never re-decoded), so every display transform is
+        // prefix-stable: the cleaned partial is always a prefix of the cleaned final, and
+        // the words frozen into the field never change across strides.
+        //
+        // Cleaning the partial (not just structurally) is what makes the frozen field text
+        // byte-identical to the final: the spurious-period filter runs on the FULL text,
+        // where its short-segment heuristic has the complete word count since the previous
+        // period. If the partial were only structurally cleaned, the display re-clean in
+        // TextInjector would run the filter on a frozen SUBSTRING, where the first segment
+        // is the tail of a longer sentence and the heuristic misfires, deleting a genuine
+        // sentence-final period and lower-casing the next word.
+        suspend fun emitPartial() {
+            if (allTokens.isEmpty()) return
+            val raw = parakeet.detokenizeTokens(allTokens)
+            if (raw.isBlank()) return
+            val cleaned = if (postprocessingEnabled)
+                raw.cleanTranscript(
+                    language = engine.currentLanguage,
+                    formatNumbersAsDigits = formatNumbersAsDigits,
+                )
+            else raw
+            if (cleaned.isBlank()) return
+            val confidence = utteranceConfidence()
+            val toSend = if (isScriptHallucination(cleaned, engine.currentLanguage)) {
+                val stripped = stripScriptHallucinations(cleaned, engine.currentLanguage)
+                if (stripped == null) return
+                TranscriptResult.Partial(stripped, confidence = confidence)
+            } else TranscriptResult.Partial(cleaned, confidence = confidence)
+            send(toSend)
+        }
+
+        // Decode every chunk whose full right context is now available, emitting a Partial each.
+        // Stops immediately if a streaming failure was recorded. After decoding, trims the
+        // buffer front to the next chunk's left-context start (audio older than that is never
+        // read again) so the buffer stays bounded during long dictations.
+        suspend fun decodeReadyChunks() {
+            while (streamFailure == null && nextChunkStart + CHUNK_SAMPLES + RIGHT_CONTEXT_SAMPLES <= totalSamples) {
+                val chunkEnd = nextChunkStart + CHUNK_SAMPLES
+                decodeChunkRange(nextChunkStart, chunkEnd, chunkEnd + RIGHT_CONTEXT_SAMPLES)
+                nextChunkStart = chunkEnd
+                if (streamFailure != null) break
+                emitPartial()
+            }
+            // Keep only what the next chunk's left context (or a flush) can still read.
+            trimBufferFront(nextChunkStart - LEFT_CONTEXT_SAMPLES)
+        }
+
+        // Flush the remaining audio (decode all leftover chunks with whatever right context is
+        // left) and emit a Final.
+        //
+        // Short utterances get a decode-context retry: the TDT decoder is extremely
+        // context-sensitive on short clips (real-model probes: 600 ms of leading silence
+        // flips blank decodes into correct words, while trailing digital silence can flip
+        // a correct decode into blank). The primary attempt re-decodes the buffer from
+        // frame 0 with [SHORT_UTT_LEAD_SILENCE_SAMPLES] of silence prepended; when that
+        // yields blank text or a confidence below [CONFIDENCE_THRESHOLD], one retry runs
+        // the original context (no lead). The best non-empty attempt wins even below the
+        // threshold; only when every attempt is blank/garbage is a "Low confidence"
+        // Failure emitted. Long utterances keep the plain continue-from-state decode.
+        suspend fun flushAsFinal(isUtteranceBoundary: Boolean) {
+            val isShort = totalSamples < SHORT_UTTERANCE_THRESHOLD_SAMPLES
+
+            // Snapshot the session-start decode state so a short-utterance attempt can
+            // re-decode the original buffer from frame 0. For < 2.5 s utterances the
+            // buffer is never front-trimmed (the first chunk needs 2.04 s of audio before
+            // decodeReadyChunks runs), so the snapshot is the complete utterance.
+            val savedBuffer = if (isShort) buffer.toList() else null
+            val savedTotalSamples = totalSamples
+
+            // Decodes the buffer from [nextChunkStart] with whatever right context
+            suspend fun decodeRemaining(padTail: Boolean = true): Pair<String, Float> {
+                if (padTail && totalSamples < MIN_PADDING_SAMPLES) {
+                    val padSamples = MIN_PADDING_SAMPLES - totalSamples
+                    buffer.addLast(ShortArray(padSamples))
+                    totalSamples += padSamples
+                }
+                while (streamFailure == null && nextChunkStart < totalSamples) {
+                    val chunkEnd = minOf(nextChunkStart + CHUNK_SAMPLES, totalSamples)
+                    decodeChunkRange(nextChunkStart, chunkEnd, totalSamples)
+                    nextChunkStart = chunkEnd
+                }
+                // The utterance is over — complete the pending word (token swaps only).
+                flushPendingWordCandidates()
+                if (streamFailure != null) return "" to 0f
+                return parakeet.detokenizeTokens(allTokens) to utteranceConfidence()
+            }
+
+            // Restores the session-start decode state and re-decodes the original buffer
+            // from frame 0, optionally with the lead silence prepended. The lead occupies
+            // absolute positions [0, SHORT_UTT_LEAD_SILENCE_SAMPLES) (bufferStart = 0);
+            // the decoder consumes it as blanks before reaching the speech. Returns
+            // (raw text, engine confidence, gated confidence).
+            suspend fun shortAttempt(withLead: Boolean, padTail: Boolean = true): Triple<String, Float, Float> {
+                checkNotNull(savedBuffer)
+                buffer.clear()
+                if (withLead) buffer.addFirst(ShortArray(SHORT_UTT_LEAD_SILENCE_SAMPLES))
+                buffer.addAll(savedBuffer)
+                bufferStart = 0
+                totalSamples = savedTotalSamples + if (withLead) SHORT_UTT_LEAD_SILENCE_SAMPLES else 0
+                state = parakeet.initialTdtState()
+                allTokens.clear()
+                totalLogProbSum = 0.0
+                totalEmissions = 0
+                nextChunkStart = 0
+                pendingEmissions = emptyList()
+                val (raw, confidence) = decodeRemaining(padTail = padTail)
+                if (streamFailure != null) return Triple("", 0f, 0f)
+                val gated = estimateConfidence(TranscriptResult.Final(raw, confidence = confidence))
+                Log.d(TAG, "[FINAL] SHORT-UTT lead=$withLead padTail=$padTail len=${raw.length} confidence=%.2f gated=%.2f threshold=%.2f"
+                    .format(confidence, gated, CONFIDENCE_THRESHOLD))
+                return Triple(raw, confidence, gated)
+            }
+
+            var result: Pair<String, Float>? = null
+            if (isShort) {
+                // A plausible word has >= 2 word characters (letters/digits). This is the
+                // plausibility floor that rejects no-word outputs — blank, lone
+                // punctuation, a single letter or digit — that the TDT decoder emits on
+                // very short or near-silent clips. Unlike the old 0.55 engine-confidence
+                // gate, it never suppresses a correct-but-low-confidence decode: the
+                // geometric-mean confidence of a single short word is fragile (one low-
+                // probability token — often the trailing period — can drag it below any
+                // fixed threshold), and other Parakeet tools emit whatever the model
+                // decodes rather than gating on confidence.
+                fun hasWord(raw: String): Boolean = raw.count { it.isLetterOrDigit() } >= 2
+
+                // Short-utterance final decode: lead-silence context anchors the first phoneme
+                // on short clips. If the lead attempt yields a plausible word, emit it;
+                // otherwise retry with the original context (no lead) — the lead silence can
+                // occasionally turn a decodable word into blank, and the plain context recovers it.
+                val (bestRaw, bestConf) = run {
+                    val (rawLead, confLead, _) = shortAttempt(withLead = true)
+                    if (streamFailure != null) return   // contained failure emitted at end of stream
+                    if (hasWord(rawLead)) {
+                        rawLead to confLead
+                    } else {
+                        Log.d(TAG, "[SHORT-UTT] lead context yielded no word — retrying without lead silence")
+                        val (rawPlain, confPlain, _) = shortAttempt(withLead = false)
+                        if (streamFailure != null) return
+                        if (hasWord(rawPlain)) rawPlain to confPlain else rawLead to confLead
+                    }
+                }
+                if (!hasWord(bestRaw)) {
+                    // No plausible word in either context — the clip is too short or
+                    // ambiguous for the model to resolve a word (typically weak
+                    // high-frequency fricatives that collapse to punctuation). Surface a
+                    // "didn't catch that" cue instead of committing a hallucination or
+                    // staying silent.
+                    Log.d(TAG, "[FINAL] short utterance decoded no word in either context — emitting NoSpeech")
+                    send(TranscriptResult.NoSpeech)
+                    return
+                }
+                result = bestRaw to bestConf
+            } else {
+                val pair = decodeRemaining()
+                if (streamFailure != null) return
+                if (pair.first.isBlank()) {
+                    Log.d(TAG, "[FINAL] flush produced no text")
+                    return
+                }
+                result = pair
+            }
+            val (raw, confidence) = checkNotNull(result)
+            val cleaned = if (postprocessingEnabled)
+                raw.cleanTranscript(language = engine.currentLanguage, formatNumbersAsDigits = formatNumbersAsDigits)
+            else raw
+            val finalText = if (cleaned.isBlank()) raw else cleaned
+            val base = TranscriptResult.Final(finalText, isUtteranceBoundary = isUtteranceBoundary, confidence = confidence)
+            val toSend = if (isScriptHallucination(finalText, engine.currentLanguage)) {
+                val stripped = stripScriptHallucinations(finalText, engine.currentLanguage)
+                if (stripped == null) {
+                    Log.w(TAG, "[FINAL] entirely non-script after strip — suppressing")
+                    TranscriptResult.Failure(RuntimeException("Non-Latin script detected — likely hallucination"))
+                } else {
+                    Log.w(TAG, "[HALLUCINATION] stripped non-script chars from final")
+                    applyGrammarCorrection(base.copy(text = stripped), engine.currentLanguage)
+                }
+            } else {
+                applyGrammarCorrection(base, engine.currentLanguage)
+            }
+            send(toSend)
+        }
+
+        audio.buffer(Channel.UNLIMITED).takeWhile { streamFailure == null }.collect { incoming ->
+            if (incoming.isSilenceBoundary) {
+                // Flush any non-empty utterance at the boundary. Short utterances are
+                // zero-padded to 1.25 s inside flushAsFinal (matching the stream-end gate),
+                // and the short-utterance confidence gate suppresses low-confidence output,
+                // so a brief noise burst is not committed. This keeps the boundary and
+                // stream-end gates aligned — both pad + flush + confidence-gate.
+                if (streamFailure == null && totalSamples > 0) {
+                    Log.d(TAG, "[BOUNDARY] utterance boundary — flushing ${totalSamples.toSec()} as Final")
+                    flushAsFinal(isUtteranceBoundary = true)
+                }
+                // Reset for the next utterance.
+                buffer.clear()
+                totalSamples = 0
+                bufferStart = 0
+                state = parakeet.initialTdtState()
+                allTokens.clear()
+                nextChunkStart = 0
+                totalLogProbSum = 0.0
+                totalEmissions = 0
+                pendingEmissions = emptyList()
+                return@collect
+            }
+
+            buffer.addLast(incoming.samples)
+            totalSamples += incoming.samples.size
+            decodeReadyChunks()
+        }
+
+        // End of stream: emit the contained streaming failure (if any), otherwise flush the
+        // remaining audio as a Final.
+        val failure = streamFailure
+        if (failure != null) {
+            Log.e(TAG, "[STREAM] emitting contained failure at end of stream")
+            send(TranscriptResult.Failure(failure))
+        } else if (totalSamples > 0) {
+            Log.d(TAG, "[FINAL] end-of-stream flush ${totalSamples.toSec()}")
+            flushAsFinal(isUtteranceBoundary = false)
+        }
+    }.flowOn(Dispatchers.Default)
+
+    /**
+     * Legacy whole-window re-transcription path. Used when the configured engine is not a
+     * [ParakeetEngine] (the Whisper/Voxtral engines, or test fakes). The Parakeet path
+     * ([transcribe]) uses chunked TDT with decoder-state carry-over; this path re-transcribes
+     * the rolling window each stride and trims on a stable prefix.
+     */
+    private fun legacyTranscribe(
+        audio: Flow<AudioChunk>,
+        postprocessingEnabled: Boolean,
+        formatNumbersAsDigits: Boolean,
     ): Flow<TranscriptResult> = channelFlow<TranscriptResult> {
         val window = ArrayDeque<ShortArray>()
         var windowSamples = 0
@@ -1230,6 +1910,15 @@ class InferenceRepository(
         var hasCommittedAnyPartial = false
         var coldStridesSuppressed = 0
 
+        // P3 (final-pass re-emission guard): the last non-blank partial emitted in this
+        // window session, with its engine confidence. When the final pass re-emits only
+        // already-seen words (pattern continuation on a trimmed window) at lower
+        // confidence than the partials, [guardFinalAgainstReemission] substitutes the
+        // last partial's text so the committed output is never a truncation of what the
+        // user already saw.
+        var lastPartialText = ""
+        var lastPartialConfidence = 1.0f
+
         fun buildChunk(): AudioChunk {
             val merged = ShortArray(windowSamples)
             var pos = 0
@@ -1263,6 +1952,41 @@ class InferenceRepository(
             windowSamples -= (dropSamples - toProcess)
         }
 
+        /**
+         * P3: guards a final-pass result against pattern-continuation re-emission.
+         *
+         * After a window trim the model sometimes decodes the retained tail as a
+         * continuation of the just-committed sentence — re-emitting committed words
+         * instead of the new content (TDT has no memory of what was already emitted).
+         * The tell-tale signature: the final's words are a strict prefix of the last
+         * partial's words AND the final's engine confidence is lower than the partial's
+         * (the re-emitted pattern is decoded less confidently than the live partial).
+         *
+         * When that signature matches, the last partial's text is returned instead: it
+         * is at least as complete as the final and reflects what the user saw. All other
+         * cases (final extends the partial, same-length refinement, truncated-leading
+         * case handled by TextInjector's composing anchor) pass the final through.
+         */
+        fun guardFinalAgainstReemission(finalText: String, finalConfidence: Float): String {
+            if (lastPartialText.isEmpty()) return finalText
+            val finalWords = finalText.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+            val partialWords = lastPartialText.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+            if (finalWords.isEmpty() || partialWords.size <= finalWords.size) return finalText
+            val isPrefixOfPartial = finalWords.zip(partialWords).all { (a, b) ->
+                a.normalizedForComparison() == b.normalizedForComparison()
+            }
+            if (isPrefixOfPartial && finalConfidence < lastPartialConfidence) {
+                Log.w(
+                    TAG,
+                    "[FINAL] re-emission guard: final (${finalWords.size}w, conf=%.2f) is a" +
+                            " lower-confidence prefix of the last partial (${partialWords.size}w," +
+                            " conf=%.2f) — keeping the partial text".format(finalConfidence, lastPartialConfidence)
+                )
+                return lastPartialText
+            }
+            return finalText
+        }
+
         audio.buffer(Channel.UNLIMITED).collect { incoming ->
             if (incoming.isSilenceBoundary) {
                 if (windowSamples >= MIN_FINAL_SAMPLES) {
@@ -1273,10 +1997,11 @@ class InferenceRepository(
                     else rawChunk
                     val result = engine.transcribe(finalChunk)
                     val isContinuation = isContinuationAfterTrim
-                    val cleaned: TranscriptResult = when (result) {
+                    val baseCleaned: TranscriptResult = when (result) {
                         is TranscriptResult.Partial -> TranscriptResult.Final(
                             text = if (postprocessingEnabled) result.text.cleanTranscriptStructural(isContinuation) else result.text,
                             isUtteranceBoundary = true,
+                            confidence = result.confidence,
                         )
 
                         is TranscriptResult.Final -> result.copy(
@@ -1286,6 +2011,10 @@ class InferenceRepository(
 
                         else -> result
                     }
+                    // P3: guard against pattern-continuation re-emission on the boundary final.
+                    val cleaned: TranscriptResult = (baseCleaned as? TranscriptResult.Final)?.let { final ->
+                        final.copy(text = guardFinalAgainstReemission(final.text, final.confidence))
+                    } ?: baseCleaned
                     Log.d(TAG, "[BOUNDARY] Final = ${cleaned.logLabel()}")
                     val cleanedText = (cleaned as? TranscriptResult.Final)?.text
                     // E3: strip non-script artefacts from the final instead of discarding the
@@ -1297,7 +2026,7 @@ class InferenceRepository(
                     ) {
                         val stripped = stripScriptHallucinations(cleanedText, language = engine.currentLanguage)
                         if (stripped != null) {
-                            Log.w(TAG, "[HALLUCINATION] stripped non-script chars from boundary final: \"$cleanedText\" → \"$stripped\"")
+                            Log.w(TAG, "[HALLUCINATION] stripped non-script chars from boundary final (${cleanedText.length} → ${stripped.length} chars)")
                             applyGrammarCorrection(cleaned.copy(text = stripped), engine.currentLanguage)
                         } else {
                             Log.w(TAG, "[HALLUCINATION] boundary final entirely non-script after strip — suppressing")
@@ -1323,6 +2052,9 @@ class InferenceRepository(
                 // Reset cold-stride gate for the next utterance within this session.
                 hasCommittedAnyPartial = false
                 coldStridesSuppressed = 0
+                // Reset the P3 guard: the next utterance is a fresh window session.
+                lastPartialText = ""
+                lastPartialConfidence = 1.0f
                 return@collect
             }
 
@@ -1407,9 +2139,9 @@ class InferenceRepository(
                 else fullCleanedTextRaw
                 if (hallucinated) {
                     if (structuralText.isBlank()) {
-                        Log.w(TAG, "[HALLUCINATION] partial entirely non-script after strip — treating as blank: \"$structuralTextRaw\"")
+                        Log.w(TAG, "[HALLUCINATION] partial entirely non-script after strip — treating as blank (${structuralTextRaw.length} chars)")
                     } else {
-                        Log.w(TAG, "[HALLUCINATION] stripped non-script chars from partial: \"$structuralTextRaw\" → \"$structuralText\"")
+                        Log.w(TAG, "[HALLUCINATION] stripped non-script chars from partial (${structuralTextRaw.length} → ${structuralText.length} chars)")
                     }
                 }
 
@@ -1457,7 +2189,7 @@ class InferenceRepository(
                 }
 
                 if (cleaned is TranscriptResult.Partial && cleaned.text.isNotBlank()) {
-                    Log.d(TAG, "[PARTIAL] clean  = \"${cleaned.text}\"")
+                    Log.d(TAG, "[PARTIAL] clean = ${cleaned.text.length} chars")
                     consecutiveBlankStrides = 0  // silence streak broken
                     // The flag was consumed by a real partial - reset it now.
                     // A trim later in this same stride can re-arm it for the *next* stride.
@@ -1516,6 +2248,9 @@ class InferenceRepository(
                         hasCommittedAnyPartial = true
                         coldStridesSuppressed = 0
                         send(cleaned)
+                        // Record for the P3 final-pass re-emission guard.
+                        lastPartialText = cleaned.text
+                        lastPartialConfidence = partialConfidence
                     }
 
                     // Use fully-cleaned word list (filler/stutter/dedup applied) for
@@ -1529,27 +2264,47 @@ class InferenceRepository(
                         ?.let { it == '.' || it == '!' || it == '?' } == true
                     // Sentence-final shortcut: when the last word of the transcript has been
                     // stable for STABLE_STRIDES consecutive strides AND the window is still
-                    // compact (≤ TRIGGER_WINDOW_SAMPLES), emit a Final immediately.
-                    // We do NOT reset the window here — the stable-chunk trim logic below
-                    // manages window size.  Resetting the window in SENTENCE_FINAL would
-                    // prevent the window from ever growing large enough for a trim, which
-                    // causes the trim tests to fail.  We only skip running the trim on
-                    // THIS stride (return@collect) because the Final already committed the text.
+                    // compact (≤ TRIGGER_WINDOW_SAMPLES), emit a Final immediately and reset
+                    // the audio window.
+                    //
+                    // The reset is what makes streaming output match non-streaming quality:
+                    // the committed sentence's audio is dropped, so the next sentence is
+                    // transcribed from a clean window exactly like a standalone utterance.
+                    // Without the reset the next partial re-emits the committed sentence
+                    // (the model still sees its audio) and TextInjector re-commits it as a
+                    // new session — visible duplication (verified with the real model on a
+                    // 9.5 s two-sentence recording: sentence 1 appeared twice).
+                    //
+                    // WindowTrimmed(stableWords = words) re-anchors TextInjector's
+                    // committed-word tracking to the committed sentence so the next
+                    // partial's suffix-overlap alignment finds the correct boundary.
                     if (endsWithSentence && recentPartialWords.size >= STABLE_STRIDES && windowSamples <= TRIGGER_WINDOW_SAMPLES) {
                         val terminalWord = words.lastOrNull()?.normalizedForComparison()
                         val prevTerminalWord = recentPartialWords[recentPartialWords.size - 2]
                             .lastOrNull()?.normalizedForComparison()
                         if (terminalWord != null && terminalWord == prevTerminalWord) {
-                            Log.d(TAG, "[SENTENCE_FINAL] stable punctuation endpoint → \"${cleaned.text}\"")
+                        Log.d(TAG, "[SENTENCE_FINAL] stable punctuation endpoint (${cleaned.text.length} chars)")
                             val sentenceFinal = TranscriptResult.Final(cleaned.text, isUtteranceBoundary = true)
                             send(applyGrammarCorrection(sentenceFinal, engine.currentLanguage))
-                            // Do NOT reset the window or recentPartialWords — let the
-                            // stable-chunk trim logic manage both on subsequent strides.
-                            // Clearing recentPartialWords here would reset the divergence
-                            // counter and delay force-trim detection.
+                            // Reset the audio window: the sentence's audio has been fully
+                            // committed and is no longer needed. The next sentence starts
+                            // from a clean window (non-streaming-equivalent conditions).
+                            window.clear()
+                            windowSamples = 0
+                            strideAccum = 0
+                            recentPartialWords.clear()
                             isContinuationAfterTrim = false
                             consecutiveBlankStrides = 0
+                            strideWaitLogged = false
+                            // Reset the cold-stride gate: the next sentence is a fresh
+                            // utterance and gets its own cold-stride confidence budget.
+                            hasCommittedAnyPartial = false
+                            coldStridesSuppressed = 0
+                            // Reset the P3 guard: the next sentence is a fresh window session.
+                            lastPartialText = ""
+                            lastPartialConfidence = 1.0f
                             dynamicStrideSamples = STRIDE_SAMPLES
+                            send(TranscriptResult.WindowTrimmed(stableWords = words))
                             return@collect
                         }
                     }
@@ -1679,7 +2434,7 @@ class InferenceRepository(
             // (2.5 s) the rolling-window logic has had little or no opportunity to fire,
             // so the normal MIN_FINAL_SAMPLES pad is too small to anchor the encoder.
             // Instead we skip the rolling-window final pass entirely and run a single
-            // inference on a buffer zero-padded to at least MIN_PADDING_SAMPLES (2 s).
+            // inference on a buffer zero-padded to at least MIN_PADDING_SAMPLES (1.25 s).
             // This correctly handles:
             //   • Utterances that ended before the first stride fired (< MIN_SAMPLES).
             //   • Very short phrases where the partial pipeline produced nothing useful.
@@ -1714,10 +2469,11 @@ class InferenceRepository(
             val result = engine.transcribe(finalChunk)
             Log.d(TAG, "[FINAL] raw   = ${result.logLabel()}")
 
-            val cleaned: TranscriptResult = when (result) {
+            val baseCleaned: TranscriptResult = when (result) {
                 is TranscriptResult.Partial -> TranscriptResult.Final(
                     text = if (postprocessingEnabled) result.text.cleanTranscriptStructural(isContinuationAfterTrim) else result.text,
                     isUtteranceBoundary = isShortUtterance,
+                    confidence = result.confidence,
                 )
 
                 is TranscriptResult.Final -> result.copy(
@@ -1727,6 +2483,10 @@ class InferenceRepository(
 
                 else -> result
             }
+            // P3: guard against pattern-continuation re-emission on the final pass.
+            val cleaned: TranscriptResult = (baseCleaned as? TranscriptResult.Final)?.let { final ->
+                final.copy(text = guardFinalAgainstReemission(final.text, final.confidence))
+            } ?: baseCleaned
             Log.d(TAG, "[FINAL] clean = ${cleaned.logLabel()}")
 
             // ── Short-utterance confidence gate ───────────────────────────────────────
@@ -1737,7 +2497,7 @@ class InferenceRepository(
             // dictation would cause unacceptable silent drops in the middle of sentences.
             // Engine failures (Failure, WindowTrimmed) are passed through unchanged.
             if (isShortUtterance && (cleaned is TranscriptResult.Final)) {
-                val confidence = estimateConfidence(cleaned, rawChunk.samples.size)
+                val confidence = estimateConfidence(cleaned)
                 Log.d(TAG, "[FINAL] SHORT-UTT confidence=%.2f threshold=%.2f".format(confidence, CONFIDENCE_THRESHOLD))
                 if (confidence < CONFIDENCE_THRESHOLD) {
                     Log.w(
@@ -1756,7 +2516,7 @@ class InferenceRepository(
                 if (finalText != null && isScriptHallucination(finalText, language = engine.currentLanguage)) {
                     val stripped = stripScriptHallucinations(finalText, language = engine.currentLanguage)
                     if (stripped != null) {
-                        Log.w(TAG, "[HALLUCINATION] stripped non-script chars from final: \"$finalText\" → \"$stripped\"")
+                        Log.w(TAG, "[HALLUCINATION] stripped non-script chars from final (${finalText.length} → ${stripped.length} chars)")
                         applyGrammarCorrection(cleaned.copy(text = stripped), engine.currentLanguage)
                     } else {
                         Log.w(TAG, "[HALLUCINATION] final entirely non-script after strip — suppressing")
@@ -1767,5 +2527,6 @@ class InferenceRepository(
                 }
             send(finalToSend)
         }
+
     }.flowOn(Dispatchers.Default)
 }
