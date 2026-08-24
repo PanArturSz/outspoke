@@ -1,4 +1,4 @@
-Eighth patch (v0.2.5).
+New feature release (v0.3.0).
 
 Transcription reliability: long dictations no longer drop or repeat words; streaming matches one-shot quality; short phrases like "thanks" are reliable.
 

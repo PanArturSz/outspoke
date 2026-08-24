@@ -59,7 +59,10 @@ as a result — each box needs an observed outcome.
 
 ## 6. Release artifacts
 
-- [ ] `./gradlew assembleRelease` builds; APK sizes within IzzyOnDroid limits.
+- [ ] `./gradlew assembleRelease` builds.
+- [ ] APK sizes within IzzyOnDroid's ~30 MB per-app budget
+      (<https://izzyondroid.org/docs/general/AppInclusionPolicy/>):
+      `arm64-v8a` ≤ 30 MB (the universal may be larger).
 - [ ] `./gradlew test` locally (with model) → full suite green.
 - [ ] Changelog file: filename = plain versionCode integer; first line `Nth patch (vX.Y.Z).`;
       `wc -m` ≤ 500 characters (see `docs/release-process.md`).

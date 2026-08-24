@@ -105,6 +105,29 @@ Pushing the tag triggers the release job in `.github/workflows/release-f-droid.y
 Watch the workflow run on the tag push and confirm it ends green.
 No local `assembleRelease` and no manual APK attachment is needed.
 
+### APK size budget (IzzyOnDroid)
+
+IzzyOnDroid reserves **up to 30 MB per app** — normally spread over at most 3 APKs — and
+that is also the upper size limit for a *single* `.apk` file. The limit is a
+rule-of-thumb: exceptions are made for larger apps, but stay in budget rather than
+relying on an exception (source:
+<https://izzyondroid.org/docs/general/AppInclusionPolicy/>).
+
+Concretely:
+- The `arm64-v8a` APK — what modern devices actually download — must stay **≤ 30 MB**
+  (a hair over is tolerated as a rule-of-thumb, treat the budget as real).
+- The universal APK may be larger: it carries both ABIs and the repo does not hold it.
+- `libonnxruntime.so` alone is ~28 MB, so the build deflates native libraries
+  (`useLegacyPackaging = true` in `app/build.gradle.kts`), which keeps `arm64-v8a` at
+  ~15 MB. Do not revert that setting.
+- Check the sizes after every `assembleRelease`:
+
+  ```bash
+  ls -la app/build/outputs/apk/release/
+  ```
+
+  If `arm64-v8a` climbs toward 30 MB, find the bloat before tagging.
+
 ## 6. IzzyOnDroid picks it up automatically
 
 IzzyOnDroid polls GitHub Releases for new tags. Once the release is published it appears
@@ -116,6 +139,6 @@ in the IzzyOnDroid repo on the next scan (usually within 24 hours). No manual su
 |----------------|-------------------------------------------------------------------------------|
 | `versionCode`  | Increment by 1 for every release, no exceptions                               |
 | `versionName`  | `0.MAJOR.PATCH` — PATCH for fixes/small features, MAJOR for large features    |
-| Git tag        | `v` + `versionName` (e.g. `v0.2.5`), must match exactly                       |
+| Git tag        | `v` + `versionName` (e.g. `v0.3.0`), must match exactly                       |
 | Fastlane file  | Plain `versionCode` integer (e.g. `10.txt`)                                   |
 | Changelog size | ≤ 500 characters (`wc -m`)                                                    |

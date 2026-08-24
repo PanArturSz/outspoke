@@ -18,8 +18,8 @@ android {
         applicationId = "dev.brgr.outspoke"
         minSdk = 30
         targetSdk = 36
-        versionCode = 9
-        versionName = "0.2.4"
+        versionCode = 10
+        versionName = "0.3.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -56,6 +56,16 @@ android {
         includeInApk = false
         // Disables dependency metadata when building Android App Bundles (for Google Play)
         includeInBundle = false
+    }
+
+    packaging {
+        // Deflate native libs in the APK (extractNativeLibs=true): IzzyOnDroid
+        // budgets ~30 MB per app, and libonnxruntime.so alone is ~28 MB when
+        // stored uncompressed. Costs ~28 MB extra on-device after install —
+        // negligible next to the 700 MB ASR model the app downloads at runtime.
+        jniLibs {
+            useLegacyPackaging = true
+        }
     }
 }
 
