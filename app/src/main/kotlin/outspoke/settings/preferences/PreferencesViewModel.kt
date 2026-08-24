@@ -26,6 +26,26 @@ class PreferencesViewModel(application: Application) : AndroidViewModel(applicat
         viewModelScope.launch { prefs.setTriggerMode(mode) }
     }
 
+    val deleteButtonMode: StateFlow<String> = prefs.deleteButtonMode.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5_000),
+        initialValue = "DELETE_ALL",
+    )
+
+    fun setDeleteButtonMode(mode: String) {
+        viewModelScope.launch { prefs.setDeleteButtonMode(mode) }
+    }
+
+    val rawMicCapture: StateFlow<Boolean> = prefs.rawMicCapture.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5_000),
+        initialValue = false,
+    )
+
+    fun setRawMicCapture(enabled: Boolean) {
+        viewModelScope.launch { prefs.setRawMicCapture(enabled) }
+    }
+
     val vadSensitivity: StateFlow<Boolean> = prefs.vadSensitivity.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5_000),

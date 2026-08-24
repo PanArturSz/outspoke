@@ -12,8 +12,9 @@ import dev.brgr.outspoke.settings.preferences.AppPreferences
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.*
-import kotlinx.coroutines.isActive
+import kotlin.math.log10
 import kotlin.math.sqrt
+import kotlinx.coroutines.isActive
 
 private const val TAG = "AudioCaptureManager"
 
@@ -30,6 +31,12 @@ private const val CHUNK_SAMPLES = 480
  */
 private const val HANGOVER_DRAIN_SAFETY_FRAMES = 20
 
+/**
+ * dBFS level at which the waveform bar reads 0.0. Levels below this floor
+ * (typical device ambient noise) are inaudible on the bar.
+ */
+private const val NOISE_FLOOR_DB = -60f
+
 // Capture source: MediaRecorder.AudioSource.DEFAULT — the vendor-recommended source.
 // It arrives at a usable level with the platform's standard voice processing, so no
 // application-side gain is applied.
@@ -42,6 +49,14 @@ private const val HANGOVER_DRAIN_SAFETY_FRAMES = 20
 // a decode-loop bug in ParakeetEngine — the predictor state must freeze on blank and
 // the initial target must be blank — now fixed. DEFAULT is good enough; per-mic
 // calibration in settings remains an optional refinement.
+//
+// Exception - [rawMicCapture] preference: `AudioSource.UNPROCESSED` is available
+// (via startCapture(rawSource = true)) to bypass the platform voice processing
+// entirely. The default source's AEC cancels audio played from the device's own
+// speaker out of the mic stream, which makes the speakerphone use case
+// (e.g. transcribing a voicemail playing on speaker) transcribe as silence.
+// The TDT decoder is level-invariant, so the rawer level of UNPROCESSED does
+// not affect transcription quality.
 
 /**
  * Manages a single [AudioRecord] session and emits captured audio as a cold
@@ -99,7 +114,7 @@ class AudioCaptureManager(private val context: Context) {
      */
     // Permission is checked manually via PermissionHelper before AudioRecord is created.
     @SuppressLint("MissingPermission")
-    fun startCapture(vadEnabled: Boolean = true): Flow<AudioChunk> =
+    fun startCapture(vadEnabled: Boolean = true, rawSource: Boolean = false): Flow<AudioChunk> =
         channelFlow {
             if (!PermissionHelper.hasRecordPermission(context)) {
                 throw SecurityException(
@@ -129,8 +144,11 @@ class AudioCaptureManager(private val context: Context) {
             // Use at least 2× the chunk size so the hardware buffer never overflows.
             val bufferBytes = maxOf(minBufferBytes, CHUNK_SAMPLES * 2 * 2)
 
+            val source = if (rawSource) MediaRecorder.AudioSource.UNPROCESSED
+            else MediaRecorder.AudioSource.DEFAULT
+
             val recorder = AudioRecord(
-                MediaRecorder.AudioSource.DEFAULT,
+                source,
                 SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT,
@@ -262,7 +280,16 @@ class AudioCaptureManager(private val context: Context) {
     /**
      * Returns the RMS for the waveform display, clamped to [0.0, 1.0].
      */
-    private fun normaliseAmplitude(rms: Float): Float = rms.coerceIn(0f, 1f)
+    private fun normaliseAmplitude(rms: Float): Float {
+        if (rms <= 0f) return 0f
+        // Full-scale-linear normalisation is useless for the waveform bar: normal
+        // speech through a phone mic with AudioSource.DEFAULT (voice processing /
+        // AGC applied) typically sits at ~1-5 % of full scale, so the bars barely
+        // move. Map the dB scale instead: NOISE_FLOOR_DB dBFS -> 0.0, 0 dBFS -> 1.0,
+        // which lifts the typical speech range (-50..-20 dBFS) to ~0.2..0.7.
+        val db = 20f * log10(rms)
+        return ((db - NOISE_FLOOR_DB) / (0f - NOISE_FLOOR_DB)).coerceIn(0f, 1f)
+    }
 
 }
 

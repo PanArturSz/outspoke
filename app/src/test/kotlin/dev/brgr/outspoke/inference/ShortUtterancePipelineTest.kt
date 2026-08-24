@@ -55,7 +55,7 @@ class ShortUtterancePipelineTest {
     private val wavReader = WavReader()
 
     private fun wavSamples(name: String): ShortArray {
-        val stream = javaClass.classLoader.getResourceAsStream("audio/$name")
+        val stream = javaClass.classLoader!!.getResourceAsStream("audio/$name")
             ?: throw IllegalStateException("WAV fixture '$name' not found on classpath")
         val pcm = wavReader.readPcm16(ByteArrayInputStream(stream.readBytes()))
         return wavReader.resampleLinear(pcm.samples, pcm.sampleRate, 16_000)

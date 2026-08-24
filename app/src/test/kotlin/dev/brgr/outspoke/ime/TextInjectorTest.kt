@@ -529,5 +529,59 @@ class TextInjectorTest {
         // Existing field content must still be present (not erased).
         assertThat(text).contains("alpha beta gamma delta epsilon zeta eta theta")
     }
+
+    // ── Delete button behaviour (deleteAll / deleteLastSentence) ─────────────────────
+
+    /**
+     * Default mode: deleteAll clears the entire field (before and after the cursor).
+     */
+    @Test
+    fun `deleteAll removes the entire field`() {
+        injector.commitFinal("Der erste Satz steht. Der zweite folgt.")
+        injector.deleteAll()
+        assertThat(ic.fieldText).isEmpty()
+    }
+
+    /**
+     * Last-sentence mode: only the last sentence before the cursor is deleted; the
+     * preceding sentence and its separating space are preserved.
+     */
+    @Test
+    fun `deleteLastSentence removes only the last sentence`() {
+        injector.commitFinal("Der erste Satz steht. Der zweite folgt.")
+        injector.deleteLastSentence()
+        assertThat(ic.fieldText).isEqualTo("Der erste Satz steht. ")
+    }
+
+    /**
+     * Multiple sentences: the boundary is the last "punctuation + whitespace" pair, so
+     * only the final sentence disappears.
+     */
+    @Test
+    fun `deleteLastSentence with multiple sentences keeps all but the last`() {
+        injector.commitFinal("One. Two. Three")
+        injector.deleteLastSentence()
+        assertThat(ic.fieldText).isEqualTo("One. Two. ")
+    }
+
+    /**
+     * No sentence boundary exists (single unpunctuated sentence) - the whole text before
+     * the cursor is treated as one sentence and deleted.
+     */
+    @Test
+    fun `deleteLastSentence without boundary deletes all text before cursor`() {
+        injector.commitFinal("Ein einziger Satz ohne Punkt")
+        injector.deleteLastSentence()
+        assertThat(ic.fieldText).isEmpty()
+    }
+
+    /**
+     * Empty field: no-op, no exception.
+     */
+    @Test
+    fun `deleteLastSentence on empty field is a no-op`() {
+        injector.deleteLastSentence()
+        assertThat(ic.fieldText).isEmpty()
+    }
 }
 

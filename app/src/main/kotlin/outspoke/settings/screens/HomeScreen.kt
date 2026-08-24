@@ -20,8 +20,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import dev.brgr.outspoke.R
 import dev.brgr.outspoke.audio.PermissionHelper
@@ -45,14 +45,21 @@ import dev.brgr.outspoke.ui.theme.OutspokeTheme
 @Composable
 fun HomeScreen(
     onNavigateToModel: () -> Unit,
-    onNavigateToPreferences: () -> Unit,
+    onNavigateToInput: () -> Unit,
+    onNavigateToSpeech: () -> Unit,
+    onNavigateToTools: () -> Unit,
 ) {
     val context = LocalContext.current
     val lifecycle = LocalLifecycleOwner.current.lifecycle
 
-    var isImeEnabled by remember { mutableStateOf(false) }
-    var hasMicPermission by remember { mutableStateOf(false) }
-    var isModelReady by remember { mutableStateOf(false) }
+    // Initialise from the live sources of truth (all three checks are
+    // synchronous and cheap) rather than from defaults. After a process-death
+    // relaunch the ON_RESUME event may already have fired before this observer
+    // is registered, so relying on it alone leaves the screen stuck on the
+    // unconfigured view.
+    var isImeEnabled by remember { mutableStateOf(isOutspokeImeEnabled(context)) }
+    var hasMicPermission by remember { mutableStateOf(PermissionHelper.hasRecordPermission(context)) }
+    var isModelReady by remember { mutableStateOf(ModelRegistry.all.any { ModelStorageManager.isModelReady(context, it) }) }
 
     val micPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission(),
@@ -65,8 +72,8 @@ fun HomeScreen(
 
     // Refresh all statuses on every ON_RESUME - catches changes made in other apps/settings.
     DisposableEffect(lifecycle) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) {
+        val observer = object : DefaultLifecycleObserver {
+            override fun onResume(owner: LifecycleOwner) {
                 isImeEnabled = isOutspokeImeEnabled(context)
                 hasMicPermission = PermissionHelper.hasRecordPermission(context)
                 isModelReady = ModelRegistry.all.any { ModelStorageManager.isModelReady(context, it) }
@@ -83,7 +90,9 @@ fun HomeScreen(
         onOpenImeSettings = { context.startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS)) },
         onRequestMicPermission = { micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO) },
         onNavigateToModel = onNavigateToModel,
-        onNavigateToPreferences = onNavigateToPreferences,
+        onNavigateToInput = onNavigateToInput,
+        onNavigateToSpeech = onNavigateToSpeech,
+        onNavigateToTools = onNavigateToTools,
     )
 }
 
@@ -95,7 +104,9 @@ private fun HomeScreenContent(
     onOpenImeSettings: () -> Unit,
     onRequestMicPermission: () -> Unit,
     onNavigateToModel: () -> Unit,
-    onNavigateToPreferences: () -> Unit,
+    onNavigateToInput: () -> Unit,
+    onNavigateToSpeech: () -> Unit,
+    onNavigateToTools: () -> Unit,
 ) {
     Column(
         modifier = Modifier
@@ -160,18 +171,21 @@ private fun HomeScreenContent(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
 
-        OutlinedButton(
-            onClick = onNavigateToPreferences,
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Icon(
-                imageVector = MyIcons.Settings,
-                contentDescription = null,
-                modifier = Modifier.size(18.dp),
-            )
-            Spacer(Modifier.width(8.dp))
-            Text(stringResource(R.string.action_keyboard_preferences))
-        }
+        ConfigurationButton(
+            icon = MyIcons.Mic,
+            label = stringResource(R.string.home_pref_input),
+            onClick = onNavigateToInput,
+        )
+        ConfigurationButton(
+            icon = MyIcons.Keyboard,
+            label = stringResource(R.string.home_pref_speech),
+            onClick = onNavigateToSpeech,
+        )
+        ConfigurationButton(
+            icon = MyIcons.Settings,
+            label = stringResource(R.string.home_pref_tools),
+            onClick = onNavigateToTools,
+        )
     }
 }
 
@@ -179,6 +193,27 @@ private fun HomeScreenContent(
 private fun isOutspokeImeEnabled(context: Context): Boolean {
     val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
     return imm.enabledInputMethodList.any { it.packageName == context.packageName }
+}
+
+/** A labelled outlined button in the Configuration section of the home screen. */
+@Composable
+private fun ConfigurationButton(
+    icon: ImageVector,
+    label: String,
+    onClick: () -> Unit,
+) {
+    OutlinedButton(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            modifier = Modifier.size(18.dp),
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(label)
+    }
 }
 
 @Composable
@@ -229,7 +264,9 @@ private fun HomeScreenNothingSetupPreview() {
             onOpenImeSettings = {},
             onRequestMicPermission = {},
             onNavigateToModel = {},
-            onNavigateToPreferences = {},
+            onNavigateToInput = {},
+            onNavigateToSpeech = {},
+            onNavigateToTools = {},
         )
     }
 }
@@ -245,7 +282,9 @@ private fun HomeScreenAllReadyPreview() {
             onOpenImeSettings = {},
             onRequestMicPermission = {},
             onNavigateToModel = {},
-            onNavigateToPreferences = {},
+            onNavigateToInput = {},
+            onNavigateToSpeech = {},
+            onNavigateToTools = {},
         )
     }
 }
@@ -261,7 +300,9 @@ private fun HomeScreenPartialSetupPreview() {
             onOpenImeSettings = {},
             onRequestMicPermission = {},
             onNavigateToModel = {},
-            onNavigateToPreferences = {},
+            onNavigateToInput = {},
+            onNavigateToSpeech = {},
+            onNavigateToTools = {},
         )
     }
 }

@@ -23,9 +23,11 @@ import dev.brgr.outspoke.audio.PermissionHelper
 import dev.brgr.outspoke.inference.InferenceService
 import dev.brgr.outspoke.settings.model.ModelStorageManager
 import dev.brgr.outspoke.settings.screens.HomeScreen
+import dev.brgr.outspoke.settings.screens.InputPreferencesScreen
 import dev.brgr.outspoke.settings.screens.MicCalibrationScreen
 import dev.brgr.outspoke.settings.screens.ModelScreen
-import dev.brgr.outspoke.settings.screens.PreferencesScreen
+import dev.brgr.outspoke.settings.screens.SpeechPreferencesScreen
+import dev.brgr.outspoke.settings.screens.ToolsPreferencesScreen
 import dev.brgr.outspoke.ui.theme.MyIcons
 import dev.brgr.outspoke.ui.theme.OutspokeTheme
 
@@ -52,7 +54,9 @@ class SettingsActivity : ComponentActivity() {
 object SettingsRoutes {
     const val HOME = "home"
     const val MODEL = "model"
-    const val PREFERENCES = "preferences"
+    const val PREF_INPUT = "pref_input"
+    const val PREF_SPEECH = "pref_speech"
+    const val PREF_TOOLS = "pref_tools"
     const val CALIBRATION = "calibration"
 }
 
@@ -65,7 +69,9 @@ private fun SettingsNavHost(navController: NavHostController) {
     val title = when (currentRoute) {
         SettingsRoutes.HOME -> stringResource(R.string.app_name)
         SettingsRoutes.MODEL -> stringResource(R.string.nav_title_model)
-        SettingsRoutes.PREFERENCES -> stringResource(R.string.nav_title_preferences)
+        SettingsRoutes.PREF_INPUT -> stringResource(R.string.nav_title_input)
+        SettingsRoutes.PREF_SPEECH -> stringResource(R.string.nav_title_speech)
+        SettingsRoutes.PREF_TOOLS -> stringResource(R.string.nav_title_tools)
         else -> stringResource(R.string.app_name)
     }
 
@@ -101,7 +107,9 @@ private fun SettingsNavHost(navController: NavHostController) {
             ) {
                 HomeScreen(
                     onNavigateToModel = { navController.navigate(SettingsRoutes.MODEL) },
-                    onNavigateToPreferences = { navController.navigate(SettingsRoutes.PREFERENCES) },
+                    onNavigateToInput = { navController.navigate(SettingsRoutes.PREF_INPUT) },
+                    onNavigateToSpeech = { navController.navigate(SettingsRoutes.PREF_SPEECH) },
+                    onNavigateToTools = { navController.navigate(SettingsRoutes.PREF_TOOLS) },
                 )
             }
             composable(
@@ -112,10 +120,16 @@ private fun SettingsNavHost(navController: NavHostController) {
             ) {
                 ModelScreen()
             }
-            composable(route = SettingsRoutes.PREFERENCES) {
-                PreferencesScreen(
+            composable(route = SettingsRoutes.PREF_INPUT) {
+                InputPreferencesScreen(
                     onNavigateToCalibration = { navController.navigate(SettingsRoutes.CALIBRATION) },
                 )
+            }
+            composable(route = SettingsRoutes.PREF_SPEECH) {
+                SpeechPreferencesScreen()
+            }
+            composable(route = SettingsRoutes.PREF_TOOLS) {
+                ToolsPreferencesScreen()
             }
             composable(route = SettingsRoutes.CALIBRATION) {
                 MicCalibrationScreen()

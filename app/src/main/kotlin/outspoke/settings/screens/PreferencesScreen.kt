@@ -20,67 +20,107 @@ import dev.brgr.outspoke.settings.preferences.PreferencesViewModel
 import dev.brgr.outspoke.ui.theme.OutspokeTheme
 
 /**
- * User-configurable keyboard preferences backed by [PreferencesViewModel] / DataStore.
+ * Category 1 — Microphone, Trigger & Delete Button.
  *
- * Settings persist across process restarts.
+ * Microphone calibration entry point, the recording trigger mode, and the
+ * behaviour of the keyboard's delete (trash) button.
+ * Backed by [PreferencesViewModel] / DataStore; settings persist across
+ * process restarts.
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun PreferencesScreen(
+fun InputPreferencesScreen(
     viewModel: PreferencesViewModel = viewModel(),
     onNavigateToCalibration: () -> Unit = {},
 ) {
     val triggerMode by viewModel.triggerMode.collectAsState()
+    val deleteButtonMode by viewModel.deleteButtonMode.collectAsState()
+    val rawMicCapture by viewModel.rawMicCapture.collectAsState()
+
+    PreferencesColumn {
+        MicSection(
+            onNavigateToCalibration = onNavigateToCalibration,
+            rawMicCapture = rawMicCapture,
+            onRawMicCaptureChange = viewModel::setRawMicCapture,
+        )
+        HorizontalDivider()
+        TriggerModeSection(
+            triggerMode = triggerMode,
+            onTriggerModeChange = viewModel::setTriggerMode,
+        )
+        HorizontalDivider()
+        DeleteButtonSection(
+            deleteButtonMode = deleteButtonMode,
+            onDeleteButtonModeChange = viewModel::setDeleteButtonMode,
+        )
+    }
+}
+
+/**
+ * Category 2 — Speech Processing.
+ *
+ * Voice activity detection, transcript post-processing, and the word
+ * suggestion bar. Backed by [PreferencesViewModel] / DataStore.
+ */
+@Composable
+fun SpeechPreferencesScreen(
+    viewModel: PreferencesViewModel = viewModel(),
+) {
     val vadSensitivity by viewModel.vadSensitivity.collectAsState()
     val postprocessingEnabled by viewModel.postprocessingEnabled.collectAsState()
-    val showPipelineDiagnostics by viewModel.showPipelineDiagnostics.collectAsState()
     val suggestionBarEnabled by viewModel.suggestionBarEnabled.collectAsState()
     val suggestionBarLanguages by viewModel.suggestionBarLanguages.collectAsState()
     val downloadStates by viewModel.downloadStates.collectAsState()
 
-    PreferencesContent(
-        triggerMode = triggerMode,
-        vadSensitivity = vadSensitivity,
-        postprocessingEnabled = postprocessingEnabled,
-        showPipelineDiagnostics = showPipelineDiagnostics,
-        suggestionBarEnabled = suggestionBarEnabled,
-        suggestionBarLanguages = suggestionBarLanguages,
-        downloadStates = downloadStates,
-        onTriggerModeChange = viewModel::setTriggerMode,
-        onVadSensitivityChange = viewModel::setVadSensitivity,
-        onPostprocessingChange = viewModel::setPostprocessingEnabled,
-        onShowPipelineDiagnosticsChange = viewModel::setShowPipelineDiagnostics,
-        onSuggestionBarEnabledChange = viewModel::setSuggestionBarEnabled,
-        onSuggestionBarLanguagesChange = viewModel::setSuggestionBarLanguages,
-        onDownloadLanguage = viewModel::downloadLanguage,
-        onCancelDownload = viewModel::cancelDownload,
-        onDeleteLanguage = viewModel::deleteLanguage,
-        onResetTutorial = viewModel::resetTutorial,
-        onNavigateToCalibration = onNavigateToCalibration,
-    )
+    PreferencesColumn {
+        VadSection(
+            vadSensitivity = vadSensitivity,
+            onVadSensitivityChange = viewModel::setVadSensitivity,
+        )
+        HorizontalDivider()
+        PostprocessingSection(
+            postprocessingEnabled = postprocessingEnabled,
+            onPostprocessingChange = viewModel::setPostprocessingEnabled,
+        )
+        HorizontalDivider()
+        SuggestionBarSection(
+            suggestionBarEnabled = suggestionBarEnabled,
+            suggestionBarLanguages = suggestionBarLanguages,
+            downloadStates = downloadStates,
+            onSuggestionBarEnabledChange = viewModel::setSuggestionBarEnabled,
+            onSuggestionBarLanguagesChange = viewModel::setSuggestionBarLanguages,
+            onDownloadLanguage = viewModel::downloadLanguage,
+            onCancelDownload = viewModel::cancelDownload,
+            onDeleteLanguage = viewModel::deleteLanguage,
+        )
+    }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+/**
+ * Category 3 — Tools.
+ *
+ * Keyboard tutorial replay and the pipeline diagnostics toggle.
+ * Backed by [PreferencesViewModel] / DataStore.
+ */
 @Composable
-private fun PreferencesContent(
-    triggerMode: String,
-    vadSensitivity: Boolean,
-    postprocessingEnabled: Boolean,
-    showPipelineDiagnostics: Boolean,
-    suggestionBarEnabled: Boolean = false,
-    suggestionBarLanguages: Set<String> = emptySet(),
-    downloadStates: Map<String, SuggestionDownloadState> = emptyMap(),
-    onTriggerModeChange: (String) -> Unit,
-    onVadSensitivityChange: (Boolean) -> Unit,
-    onPostprocessingChange: (Boolean) -> Unit,
-    onShowPipelineDiagnosticsChange: (Boolean) -> Unit,
-    onSuggestionBarEnabledChange: (Boolean) -> Unit = {},
-    onSuggestionBarLanguagesChange: (Set<String>) -> Unit = {},
-    onDownloadLanguage: (String) -> Unit = {},
-    onCancelDownload: (String) -> Unit = {},
-    onDeleteLanguage: (String) -> Unit = {},
-    onResetTutorial: () -> Unit = {},
-    onNavigateToCalibration: () -> Unit = {},
+fun ToolsPreferencesScreen(
+    viewModel: PreferencesViewModel = viewModel(),
 ) {
+    val showPipelineDiagnostics by viewModel.showPipelineDiagnostics.collectAsState()
+
+    PreferencesColumn {
+        TutorialSection(onResetTutorial = viewModel::resetTutorial)
+        HorizontalDivider()
+        DiagnosticsSection(
+            showPipelineDiagnostics = showPipelineDiagnostics,
+            onShowPipelineDiagnosticsChange = viewModel::setShowPipelineDiagnostics,
+        )
+    }
+}
+
+/** Shared scroll container for the category preference screens. */
+@Composable
+private fun PreferencesColumn(content: @Composable ColumnScope.() -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -88,241 +128,339 @@ private fun PreferencesContent(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(24.dp),
     ) {
+        content()
+    }
+}
 
-
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(
-                text = stringResource(R.string.pref_mic_title),
-                style = MaterialTheme.typography.titleMedium,
-            )
-            Text(
-                text = stringResource(R.string.pref_mic_subtitle),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Button(
-                onClick = onNavigateToCalibration,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text(stringResource(R.string.pref_mic_calibrate))
-            }
+@Composable
+private fun MicSection(
+    onNavigateToCalibration: () -> Unit,
+    rawMicCapture: Boolean,
+    onRawMicCaptureChange: (Boolean) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            text = stringResource(R.string.pref_mic_title),
+            style = MaterialTheme.typography.titleMedium,
+        )
+        Text(
+            text = stringResource(R.string.pref_mic_subtitle),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Button(
+            onClick = onNavigateToCalibration,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(stringResource(R.string.pref_mic_calibrate))
         }
 
-        HorizontalDivider()
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            text = stringResource(R.string.pref_raw_mic_title),
+            style = MaterialTheme.typography.titleSmall,
+        )
+        Text(
+            text = stringResource(R.string.pref_raw_mic_subtitle),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
             Text(
-                text = stringResource(R.string.pref_trigger_mode_title),
-                style = MaterialTheme.typography.titleMedium,
+                text = if (rawMicCapture) stringResource(R.string.state_enabled)
+                else stringResource(R.string.state_disabled),
+                style = MaterialTheme.typography.bodyMedium,
             )
-            Text(
-                text = stringResource(R.string.pref_trigger_mode_subtitle),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            Switch(
+                checked = rawMicCapture,
+                onCheckedChange = onRawMicCaptureChange,
             )
-            SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-                SegmentedButton(
-                    selected = triggerMode == "HOLD",
-                    onClick = { onTriggerModeChange("HOLD") },
-                    shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2),
-                ) {
-                    Text(stringResource(R.string.pref_trigger_hold))
-                }
-                SegmentedButton(
-                    selected = triggerMode == "TAP_TOGGLE",
-                    onClick = { onTriggerModeChange("TAP_TOGGLE") },
-                    shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2),
-                ) {
-                    Text(stringResource(R.string.pref_trigger_tap_toggle))
-                }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TriggerModeSection(
+    triggerMode: String,
+    onTriggerModeChange: (String) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            text = stringResource(R.string.pref_trigger_mode_title),
+            style = MaterialTheme.typography.titleMedium,
+        )
+        Text(
+            text = stringResource(R.string.pref_trigger_mode_subtitle),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+            SegmentedButton(
+                selected = triggerMode == "HOLD",
+                onClick = { onTriggerModeChange("HOLD") },
+                shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2),
+            ) {
+                Text(stringResource(R.string.pref_trigger_hold))
+            }
+            SegmentedButton(
+                selected = triggerMode == "TAP_TOGGLE",
+                onClick = { onTriggerModeChange("TAP_TOGGLE") },
+                shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2),
+            ) {
+                Text(stringResource(R.string.pref_trigger_tap_toggle))
             }
         }
+    }
+}
 
-        HorizontalDivider()
-
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(
-                text = stringResource(R.string.pref_vad_title),
-                style = MaterialTheme.typography.titleMedium,
-            )
-            Text(
-                text = stringResource(R.string.pref_vad_subtitle),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun DeleteButtonSection(
+    deleteButtonMode: String,
+    onDeleteButtonModeChange: (String) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            text = stringResource(R.string.pref_delete_title),
+            style = MaterialTheme.typography.titleMedium,
+        )
+        Text(
+            text = stringResource(R.string.pref_delete_subtitle),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+            SegmentedButton(
+                selected = deleteButtonMode == "DELETE_ALL",
+                onClick = { onDeleteButtonModeChange("DELETE_ALL") },
+                shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2),
             ) {
-                Text(
-                    text = if (vadSensitivity) stringResource(R.string.state_enabled)
-                    else stringResource(R.string.state_disabled),
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-                Switch(
-                    checked = vadSensitivity,
-                    onCheckedChange = onVadSensitivityChange,
-                )
+                Text(stringResource(R.string.pref_delete_all))
+            }
+            SegmentedButton(
+                selected = deleteButtonMode == "DELETE_LAST_SENTENCE",
+                onClick = { onDeleteButtonModeChange("DELETE_LAST_SENTENCE") },
+                shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2),
+            ) {
+                Text(stringResource(R.string.pref_delete_last_sentence))
             }
         }
+    }
+}
 
-        HorizontalDivider()
+@Composable
+private fun VadSection(
+    vadSensitivity: Boolean,
+    onVadSensitivityChange: (Boolean) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            text = stringResource(R.string.pref_vad_title),
+            style = MaterialTheme.typography.titleMedium,
+        )
+        Text(
+            text = stringResource(R.string.pref_vad_subtitle),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text(
+                text = if (vadSensitivity) stringResource(R.string.state_enabled)
+                else stringResource(R.string.state_disabled),
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Switch(
+                checked = vadSensitivity,
+                onCheckedChange = onVadSensitivityChange,
+            )
+        }
+    }
+}
 
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+@Composable
+private fun PostprocessingSection(
+    postprocessingEnabled: Boolean,
+    onPostprocessingChange: (Boolean) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            text = stringResource(R.string.pref_postprocessing_title),
+            style = MaterialTheme.typography.titleMedium,
+        )
+        Text(
+            text = stringResource(R.string.pref_postprocessing_subtitle),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
             Text(
-                text = stringResource(R.string.pref_postprocessing_title),
-                style = MaterialTheme.typography.titleMedium,
+                text = if (postprocessingEnabled) stringResource(R.string.state_enabled)
+                else stringResource(R.string.pref_postprocessing_disabled_raw),
+                style = MaterialTheme.typography.bodyMedium,
             )
+            Switch(
+                checked = postprocessingEnabled,
+                onCheckedChange = onPostprocessingChange,
+            )
+        }
+    }
+}
+
+/**
+ * Word Suggestion Bar — master toggle + per-language download controls.
+ */
+@Composable
+private fun SuggestionBarSection(
+    suggestionBarEnabled: Boolean,
+    suggestionBarLanguages: Set<String>,
+    downloadStates: Map<String, SuggestionDownloadState>,
+    onSuggestionBarEnabledChange: (Boolean) -> Unit,
+    onSuggestionBarLanguagesChange: (Set<String>) -> Unit,
+    onDownloadLanguage: (String) -> Unit,
+    onCancelDownload: (String) -> Unit,
+    onDeleteLanguage: (String) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            text = stringResource(R.string.pref_suggestion_bar_title),
+            style = MaterialTheme.typography.titleMedium,
+        )
+        Text(
+            text = stringResource(R.string.pref_suggestion_bar_subtitle),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
             Text(
-                text = stringResource(R.string.pref_postprocessing_subtitle),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                text = if (suggestionBarEnabled) stringResource(R.string.pref_suggestion_bar_enabled)
+                else stringResource(R.string.pref_suggestion_bar_disabled),
+                style = MaterialTheme.typography.bodyMedium,
             )
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Text(
-                    text = if (postprocessingEnabled) stringResource(R.string.state_enabled)
-                    else stringResource(R.string.pref_postprocessing_disabled_raw),
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-                Switch(
-                    checked = postprocessingEnabled,
-                    onCheckedChange = onPostprocessingChange,
-                )
-            }
+            Switch(
+                checked = suggestionBarEnabled,
+                onCheckedChange = onSuggestionBarEnabledChange,
+            )
         }
 
-        HorizontalDivider()
-
-
-        // Word Suggestion Bar — master toggle + per-language download controls.
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (suggestionBarEnabled) {
+            Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = stringResource(R.string.pref_suggestion_bar_title),
-                style = MaterialTheme.typography.titleMedium,
+                text = stringResource(R.string.pref_suggestion_bar_languages_title),
+                style = MaterialTheme.typography.titleSmall,
             )
             Text(
-                text = stringResource(R.string.pref_suggestion_bar_subtitle),
+                text = stringResource(R.string.pref_suggestion_bar_languages_subtitle),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Text(
-                    text = if (suggestionBarEnabled) stringResource(R.string.pref_suggestion_bar_enabled)
-                    else stringResource(R.string.pref_suggestion_bar_disabled),
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-                Switch(
-                    checked = suggestionBarEnabled,
-                    onCheckedChange = onSuggestionBarEnabledChange,
+            Spacer(modifier = Modifier.height(4.dp))
+
+            // One row per supported language with download state + enable toggle.
+            SuggestionLanguage.entries.forEach { lang ->
+                val dlState = downloadStates[lang.tag] ?: SuggestionDownloadState.NotDownloaded
+                val isReady = dlState is SuggestionDownloadState.Ready
+                val isSelected = lang.tag in suggestionBarLanguages
+
+                SuggestionLanguageRow(
+                    language = lang,
+                    downloadState = dlState,
+                    isSelected = isSelected,
+                    onToggleSelected = { checked ->
+                        if (isReady) {
+                            val updated = if (checked) suggestionBarLanguages + lang.tag
+                            else suggestionBarLanguages - lang.tag
+                            onSuggestionBarLanguagesChange(updated)
+                        }
+                    },
+                    onDownload = { onDownloadLanguage(lang.tag) },
+                    onCancelDownload = { onCancelDownload(lang.tag) },
+                    onDelete = { onDeleteLanguage(lang.tag) },
                 )
             }
 
-            if (suggestionBarEnabled) {
-                Spacer(modifier = Modifier.height(4.dp))
+            val anyReady = SuggestionLanguage.entries.any {
+                downloadStates[it.tag] is SuggestionDownloadState.Ready && it.tag in suggestionBarLanguages
+            }
+            if (!anyReady) {
                 Text(
-                    text = stringResource(R.string.pref_suggestion_bar_languages_title),
-                    style = MaterialTheme.typography.titleSmall,
-                )
-                Text(
-                    text = stringResource(R.string.pref_suggestion_bar_languages_subtitle),
+                    text = stringResource(R.string.pref_suggestion_bar_no_language),
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Spacer(modifier = Modifier.height(4.dp))
-
-                // One row per supported language with download state + enable toggle.
-                SuggestionLanguage.entries.forEach { lang ->
-                    val dlState = downloadStates[lang.tag] ?: SuggestionDownloadState.NotDownloaded
-                    val isReady = dlState is SuggestionDownloadState.Ready
-                    val isSelected = lang.tag in suggestionBarLanguages
-
-                    SuggestionLanguageRow(
-                        language = lang,
-                        downloadState = dlState,
-                        isSelected = isSelected,
-                        onToggleSelected = { checked ->
-                            if (isReady) {
-                                val updated = if (checked) suggestionBarLanguages + lang.tag
-                                else suggestionBarLanguages - lang.tag
-                                onSuggestionBarLanguagesChange(updated)
-                            }
-                        },
-                        onDownload = { onDownloadLanguage(lang.tag) },
-                        onCancelDownload = { onCancelDownload(lang.tag) },
-                        onDelete = { onDeleteLanguage(lang.tag) },
-                    )
-                }
-
-                val anyReady = SuggestionLanguage.entries.any {
-                    downloadStates[it.tag] is SuggestionDownloadState.Ready && it.tag in suggestionBarLanguages
-                }
-                if (!anyReady) {
-                    Text(
-                        text = stringResource(R.string.pref_suggestion_bar_no_language),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
-                    )
-                }
-            }
-        }
-
-        HorizontalDivider()
-
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(
-                text = stringResource(R.string.pref_tutorial_title),
-                style = MaterialTheme.typography.titleMedium,
-            )
-            Text(
-                text = stringResource(R.string.pref_tutorial_subtitle),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            OutlinedButton(
-                onClick = onResetTutorial,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text(stringResource(R.string.pref_tutorial_reset))
-            }
-        }
-
-        HorizontalDivider()
-
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(
-                text = stringResource(R.string.pref_diagnostics_title),
-                style = MaterialTheme.typography.titleMedium,
-            )
-            Text(
-                text = stringResource(R.string.pref_diagnostics_subtitle),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Text(
-                    text = if (showPipelineDiagnostics) stringResource(R.string.pref_diagnostics_visible)
-                    else stringResource(R.string.pref_diagnostics_hidden),
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-                Switch(
-                    checked = showPipelineDiagnostics,
-                    onCheckedChange = onShowPipelineDiagnosticsChange,
+                    color = MaterialTheme.colorScheme.error,
                 )
             }
         }
+    }
+}
 
+@Composable
+private fun TutorialSection(
+    onResetTutorial: () -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            text = stringResource(R.string.pref_tutorial_title),
+            style = MaterialTheme.typography.titleMedium,
+        )
+        Text(
+            text = stringResource(R.string.pref_tutorial_subtitle),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        OutlinedButton(
+            onClick = onResetTutorial,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(stringResource(R.string.pref_tutorial_reset))
+        }
+    }
+}
+
+@Composable
+private fun DiagnosticsSection(
+    showPipelineDiagnostics: Boolean,
+    onShowPipelineDiagnosticsChange: (Boolean) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            text = stringResource(R.string.pref_diagnostics_title),
+            style = MaterialTheme.typography.titleMedium,
+        )
+        Text(
+            text = stringResource(R.string.pref_diagnostics_subtitle),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text(
+                text = if (showPipelineDiagnostics) stringResource(R.string.pref_diagnostics_visible)
+                else stringResource(R.string.pref_diagnostics_hidden),
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Switch(
+                checked = showPipelineDiagnostics,
+                onCheckedChange = onShowPipelineDiagnosticsChange,
+            )
+        }
     }
 }
 
@@ -424,65 +562,101 @@ private fun SuggestionLanguageRow(
     }
 }
 
-
-@Preview(showBackground = true, name = "Preferences · Hold / VAD Off")
+@Preview(showBackground = true, name = "Prefs · Microphone")
 @Composable
-private fun PreferencesHoldVadOffPreview() {
+private fun MicSectionPreview() {
     OutspokeTheme {
-        PreferencesContent(
-            triggerMode = "HOLD",
-            vadSensitivity = false,
-            postprocessingEnabled = true,
-            showPipelineDiagnostics = false,
-            onTriggerModeChange = {},
-            onVadSensitivityChange = {},
-            onPostprocessingChange = {},
-            onShowPipelineDiagnosticsChange = {},
-        )
+        PreferencesColumn {
+            MicSection(onNavigateToCalibration = {}, rawMicCapture = false, onRawMicCaptureChange = {})
+        }
     }
 }
 
-@Preview(showBackground = true, name = "Preferences · Tap Toggle / VAD On")
+@OptIn(ExperimentalMaterial3Api::class)
+@Preview(showBackground = true, name = "Prefs · Trigger Mode (Hold)")
 @Composable
-private fun PreferencesTapToggleVadOnPreview() {
+private fun TriggerModeSectionHoldPreview() {
     OutspokeTheme {
-        PreferencesContent(
-            triggerMode = "TAP_TOGGLE",
-            vadSensitivity = true,
-            postprocessingEnabled = false,
-            showPipelineDiagnostics = true,
-            onTriggerModeChange = {},
-            onVadSensitivityChange = {},
-            onPostprocessingChange = {},
-            onShowPipelineDiagnosticsChange = {},
-        )
+        PreferencesColumn {
+            TriggerModeSection(triggerMode = "HOLD", onTriggerModeChange = {})
+        }
     }
 }
 
-@Preview(showBackground = true, name = "Preferences · Suggestion Bar Enabled")
+@OptIn(ExperimentalMaterial3Api::class)
+@Preview(showBackground = true, name = "Prefs · Trigger Mode (Tap Toggle)")
 @Composable
-private fun PreferencesSuggestionBarPreview() {
+private fun TriggerModeSectionTapTogglePreview() {
     OutspokeTheme {
-        PreferencesContent(
-            triggerMode = "HOLD",
-            vadSensitivity = false,
-            postprocessingEnabled = true,
-            showPipelineDiagnostics = false,
-            suggestionBarEnabled = true,
-            suggestionBarLanguages = setOf("en"),
-            downloadStates = mapOf(
-                "nl" to SuggestionDownloadState.NotDownloaded,
-                "en" to SuggestionDownloadState.Ready,
-                "fr" to SuggestionDownloadState.Downloading(0.45f),
-                "de" to SuggestionDownloadState.Failed("Network error"),
-                "it" to SuggestionDownloadState.NotDownloaded,
-                "pl" to SuggestionDownloadState.NotDownloaded,
-                "es" to SuggestionDownloadState.NotDownloaded,
-            ),
-            onTriggerModeChange = {},
-            onVadSensitivityChange = {},
-            onPostprocessingChange = {},
-            onShowPipelineDiagnosticsChange = {},
-        )
+        PreferencesColumn {
+            TriggerModeSection(triggerMode = "TAP_TOGGLE", onTriggerModeChange = {})
+        }
+    }
+}
+
+@Preview(showBackground = true, name = "Prefs · VAD Enabled")
+@Composable
+private fun VadSectionPreview() {
+    OutspokeTheme {
+        PreferencesColumn {
+            VadSection(vadSensitivity = true, onVadSensitivityChange = {})
+        }
+    }
+}
+
+@Preview(showBackground = true, name = "Prefs · Post-Processing Disabled")
+@Composable
+private fun PostprocessingSectionPreview() {
+    OutspokeTheme {
+        PreferencesColumn {
+            PostprocessingSection(postprocessingEnabled = false, onPostprocessingChange = {})
+        }
+    }
+}
+
+@Preview(showBackground = true, name = "Prefs · Suggestion Bar Enabled")
+@Composable
+private fun SuggestionBarSectionPreview() {
+    OutspokeTheme {
+        PreferencesColumn {
+            SuggestionBarSection(
+                suggestionBarEnabled = true,
+                suggestionBarLanguages = setOf("en"),
+                downloadStates = mapOf(
+                    "nl" to SuggestionDownloadState.NotDownloaded,
+                    "en" to SuggestionDownloadState.Ready,
+                    "fr" to SuggestionDownloadState.Downloading(0.45f),
+                    "de" to SuggestionDownloadState.Failed("Network error"),
+                    "it" to SuggestionDownloadState.NotDownloaded,
+                    "pl" to SuggestionDownloadState.NotDownloaded,
+                    "es" to SuggestionDownloadState.NotDownloaded,
+                ),
+                onSuggestionBarEnabledChange = {},
+                onSuggestionBarLanguagesChange = {},
+                onDownloadLanguage = {},
+                onCancelDownload = {},
+                onDeleteLanguage = {},
+            )
+        }
+    }
+}
+
+@Preview(showBackground = true, name = "Prefs · Tutorial")
+@Composable
+private fun TutorialSectionPreview() {
+    OutspokeTheme {
+        PreferencesColumn {
+            TutorialSection(onResetTutorial = {})
+        }
+    }
+}
+
+@Preview(showBackground = true, name = "Prefs · Diagnostics Visible")
+@Composable
+private fun DiagnosticsSectionPreview() {
+    OutspokeTheme {
+        PreferencesColumn {
+            DiagnosticsSection(showPipelineDiagnostics = true, onShowPipelineDiagnosticsChange = {})
+        }
     }
 }

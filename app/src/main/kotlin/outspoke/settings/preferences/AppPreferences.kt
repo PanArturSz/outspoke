@@ -30,6 +30,43 @@ class AppPreferences(private val context: Context) {
         context.dataStore.edit { prefs -> prefs[keyTriggerMode] = mode }
     }
 
+    private val keyDeleteButtonMode = stringPreferencesKey("delete_button_mode")
+
+    /**
+     * What the keyboard's delete (trash) button does:
+     *   `"DELETE_ALL"` (default) — clears the entire editor field.
+     *   `"DELETE_LAST_SENTENCE"` — removes only the last sentence before the cursor,
+     *   so a long document is never wiped by a single tap.
+     */
+    val deleteButtonMode: Flow<String> = context.dataStore.data.map { prefs ->
+        prefs[keyDeleteButtonMode] ?: "DELETE_ALL"
+    }
+
+    suspend fun setDeleteButtonMode(mode: String) {
+        context.dataStore.edit { prefs -> prefs[keyDeleteButtonMode] = mode }
+    }
+
+    private val keyRawMicCapture = booleanPreferencesKey("raw_mic_capture")
+
+    /**
+     * When `true`, [dev.brgr.outspoke.audio.AudioCaptureManager] captures from
+     * [android.media.MediaRecorder.AudioSource.UNPROCESSED] instead of
+     * [android.media.MediaRecorder.AudioSource.DEFAULT], bypassing the platform's
+     * voice processing (AEC / NS / AGC).
+     *
+     * Required for the speakerphone use case: with the default (voice-processed)
+     * source, audio played from the device's own speaker is cancelled out of the
+     * mic stream by AEC, so e.g. a voicemail playing on speaker transcribes as
+     * silence. Off by default to keep the standard capture behaviour.
+     */
+    val rawMicCapture: Flow<Boolean> = context.dataStore.data.map { prefs ->
+        prefs[keyRawMicCapture] ?: false
+    }
+
+    suspend fun setRawMicCapture(enabled: Boolean) {
+        context.dataStore.edit { prefs -> prefs[keyRawMicCapture] = enabled }
+    }
+
     private val keyVadEnabled = booleanPreferencesKey("vad_enabled")
 
     /** Whether VAD (voice activity detection) is active. Defaults to `true`. */

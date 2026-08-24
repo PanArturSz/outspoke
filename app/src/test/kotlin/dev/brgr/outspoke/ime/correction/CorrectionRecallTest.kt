@@ -99,7 +99,7 @@ class CorrectionRecallTest {
     )
 
     private fun loadSamples(name: String): ShortArray {
-        val stream = javaClass.classLoader.getResourceAsStream("audio/$name.wav")
+        val stream = javaClass.classLoader!!.getResourceAsStream("audio/$name.wav")
             ?: throw IllegalStateException("WAV fixture '$name' not found on classpath")
         val pcm = WavReader().readPcm16(ByteArrayInputStream(stream.readBytes()))
         return WavReader().resampleLinear(pcm.samples, pcm.sampleRate, 16_000)
@@ -215,7 +215,7 @@ class CorrectionRecallTest {
                     if (hit) hits++
                     // Dictionary-only baseline (the pre-overhaul pipeline: no acoustic
                     // evidence, phonetic + edit-distance candidates with the fixed prior).
-                    val baseline = corrector!!.correct(wrong, context, emptyList())
+                    val baseline = corrector.correct(wrong, context, emptyList())
                     if (right in baseline) baselineHits++
                     println(
                         "  acoustic=${acoustic.take(5).map { it.word }} rescored=$candidates hit=$hit baseline=$baseline"

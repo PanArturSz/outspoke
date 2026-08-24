@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        Dark-mode variant of the launcher theme. Without this, the platform
+        splash (window background shown before the first Compose frame) always
+        uses the light theme, causing a brightness flash on cold launch for
+        dark-themed devices.
+    -->
+    <style name="Theme.Outspoke" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/splash_background</item>
+    </style>
+</resources>

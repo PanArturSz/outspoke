@@ -7,7 +7,9 @@
 
     <!-- Navigation titles -->
     <string name="nav_title_model">Modell herunterladen</string>
-    <string name="nav_title_preferences">Einstellungen</string>
+    <string name="nav_title_input">Mikrofon &amp; Auslöser</string>
+    <string name="nav_title_speech">Sprachverarbeitung</string>
+    <string name="nav_title_tools">Werkzeuge</string>
 
     <!-- Common actions -->
     <string name="action_open_settings">Einstellungen öffnen</string>
@@ -20,7 +22,6 @@
     <string name="action_set_as_active">Als aktiv festlegen</string>
     <string name="action_download_anyway">Trotzdem herunterladen</string>
     <string name="action_open_outspoke">Outspoke öffnen</string>
-    <string name="action_keyboard_preferences">Tastatureinstellungen</string>
 
     <!-- Common states -->
     <string name="state_enabled">Aktiviert</string>
@@ -58,12 +59,21 @@
     <string name="home_model_not_downloaded_subtitle">Lade ein Transkriptionsmodell herunter, um die Tastatur zu
         verwenden.
     </string>
+    <string name="home_pref_input">Mikrofon &amp; Auslösemodus</string>
+    <string name="home_pref_speech">Spracherkennung, Nachbearbeitung &amp; Vorschläge</string>
+    <string name="home_pref_tools">Tutorial &amp; Diagnose</string>
 
     <!-- Preferences screen -->
     <string name="pref_trigger_mode_title">Auslösemodus</string>
     <string name="pref_trigger_mode_subtitle">Wie die Sprachaufnahme gestartet und gestoppt wird.</string>
     <string name="pref_trigger_hold">Halten zum Sprechen</string>
     <string name="pref_trigger_tap_toggle">Tippen zum Umschalten</string>
+    <string name="pref_delete_title">Löschen-Button</string>
+    <string name="pref_delete_subtitle">Was der Müll-Button auf der Tastatur löscht. \"Letzter Satz\" entfernt nur den
+        letzten Satz vor dem Cursor, damit ein langes Dokument nie versehentlich gelöscht wird.
+    </string>
+    <string name="pref_delete_all">Gesamter Text</string>
+    <string name="pref_delete_last_sentence">Letzter Satz</string>
     <string name="pref_vad_title">Sprachaktivitätserkennung (VAD)</string>
     <string name="pref_vad_subtitle">Verwendet Silero VAD, um Stille und Hintergrundgeräusche vor der Transkription
         herauszufiltern. Nur deaktivieren, wenn VAD den Anfang deiner Sprache abschneidet oder leere Ergebnisse erzeugt.
@@ -142,5 +152,15 @@
     <string name="tutorial_skip">Überspringen</string>
     <string name="tutorial_next">Weiter</string>
     <string name="tutorial_dismiss">Verstanden!</string>
+    <!-- Preferences · microphone section -->
+    <string name="pref_mic_title">Mikrofon</string>
+    <string name="pref_mic_subtitle">Kalibrieren, um das klarste Mikrofon für kurze Wörter wie \"Thanks\" auszuwählen.</string>
+    <string name="pref_mic_calibrate">Mikrofone kalibrieren</string>
+    <string name="pref_raw_mic_title">Rohes Mikrofon (ohne Echo-Kompensation)</string>
+    <string name="pref_raw_mic_subtitle">Umgeht die Echo-Kompensation und Rauschunterdrückung der Plattform. Aktivieren, wenn
+        Ton vom eigenen Lautsprecher des Geräts transkribiert wird (z. B. Anrufbeantworter auf Lautsprecher) – mit der
+        Standardquelle wird das Lautsprecher-Signal aus dem Mikrofon entfernt und es wird Stille transkribiert. In
+        lauten Räumen etwas weniger saubere Aufnahme.
+    </string>
 </resources>
 

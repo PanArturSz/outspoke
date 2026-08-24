@@ -49,6 +49,23 @@ class KeyboardViewModel(
         .stateIn(viewModelScope, SharingStarted.Eagerly, "HOLD")
 
     /**
+     * What the delete (trash) button does: `"DELETE_ALL"` (default) or
+     * `"DELETE_LAST_SENTENCE"`. Collected eagerly so [deleteAll] can read a
+     * synchronous snapshot without a suspend context.
+     */
+    val deleteButtonMode: StateFlow<String> = appPreferences.deleteButtonMode
+        .stateIn(viewModelScope, SharingStarted.Eagerly, "DELETE_ALL")
+
+    /**
+     * `true` when the user opted into raw (unprocessed) microphone capture,
+     * which bypasses the platform's echo cancellation - needed when transcribing
+     * audio played from the device's own speaker.
+     * Collected eagerly so [onRecordStart] can read a synchronous snapshot.
+     */
+    val rawMicCapture: StateFlow<Boolean> = appPreferences.rawMicCapture
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
+    /**
      * Whether VAD (voice activity detection) is enabled. Collected eagerly so the value is
      * always available as a snapshot when recording starts - no suspend context required.
      */
@@ -369,9 +386,17 @@ class KeyboardViewModel(
         textInjector?.deleteWord()
     }
 
-    /** Delete all text in the current editor field. */
+    /**
+     * Performs the configured delete action: clears the whole editor field
+     * ([deleteButtonMode] == `"DELETE_ALL"`, the default) or removes only the
+     * last sentence before the cursor (`"DELETE_LAST_SENTENCE"`).
+     */
     fun deleteAll() {
-        textInjector?.deleteAll()
+        if (deleteButtonMode.value == "DELETE_LAST_SENTENCE") {
+            textInjector?.deleteLastSentence()
+        } else {
+            textInjector?.deleteAll()
+        }
     }
 
     /** Insert a newline at the current cursor position, replacing any active selection. */
@@ -464,6 +489,7 @@ class KeyboardViewModel(
                 repo.transcribe(
                     audio = audioCaptureManager.startCapture(
                         vadEnabled = vadSensitivity.value,
+                        rawSource = rawMicCapture.value,
                     ),
                     postprocessingEnabled = postprocessingEnabled.value,
                     formatNumbersAsDigits = formatNumbersAsDigits.value,

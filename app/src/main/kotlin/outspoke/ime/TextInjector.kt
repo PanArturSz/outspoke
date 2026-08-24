@@ -985,6 +985,38 @@ class TextInjector(
     }
 
     /**
+     * Deletes the last sentence from the text before the cursor.
+     *
+     * A sentence boundary is a sentence-ending punctuation (`.`, `!`, `?`)
+     * immediately followed by whitespace. The trailing whitespace after the
+     * final punctuation is deleted together with the sentence; the separating
+     * whitespace before the sentence is kept.
+     *
+     * When no boundary exists the whole text before the cursor is treated as
+     * one sentence and deleted. Text after the cursor is never touched.
+     */
+    fun deleteLastSentence() {
+        val before = inputConnection.getTextBeforeCursor(100_000, 0)?.toString() ?: return
+        if (before.isEmpty()) return
+
+        // Scan backwards for the last "punctuation + whitespace" pair.
+        var boundary = 0
+        for (i in before.length - 1 downTo 1) {
+            val prev = before[i - 1]
+            if (before[i].isWhitespace() && (prev == '.' || prev == '!' || prev == '?')) {
+                boundary = i
+                break
+            }
+        }
+        // With a boundary, keep the separating whitespace and delete from the
+        // character after it; without one, the whole text is one sentence.
+        val deleteCount = if (boundary == 0) before.length else before.length - boundary - 1
+        if (deleteCount > 0) {
+            inputConnection.deleteSurroundingText(deleteCount, 0)
+        }
+    }
+
+    /**
      * Returns the word the cursor is currently positioned inside, or `null` when the cursor
      * is not within a word (e.g. it is between two spaces, or the field is empty).
      *
