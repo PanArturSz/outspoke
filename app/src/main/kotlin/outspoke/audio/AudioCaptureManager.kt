@@ -37,6 +37,14 @@ private const val HANGOVER_DRAIN_SAFETY_FRAMES = 20
  */
 private const val NOISE_FLOOR_DB = -60f
 
+/**
+ * Display gain applied to the normalised waveform amplitude after the dB mapping.
+ * Purely cosmetic: [amplitude] only feeds the [WaveformBar] animation. Typical speech
+ * (-50..-20 dBFS) otherwise lands at ~0.2..0.7, which reads as "low gain" on the bar;
+ * 1.5× lifts it to ~0.3..1.0 with loud speech reaching full height.
+ */
+private const val WAVEFORM_DISPLAY_GAIN = 1.5f
+
 // Capture source: MediaRecorder.AudioSource.DEFAULT — the vendor-recommended source.
 // It arrives at a usable level with the platform's standard voice processing, so no
 // application-side gain is applied.
@@ -288,7 +296,7 @@ class AudioCaptureManager(private val context: Context) {
         // move. Map the dB scale instead: NOISE_FLOOR_DB dBFS -> 0.0, 0 dBFS -> 1.0,
         // which lifts the typical speech range (-50..-20 dBFS) to ~0.2..0.7.
         val db = 20f * log10(rms)
-        return ((db - NOISE_FLOOR_DB) / (0f - NOISE_FLOOR_DB)).coerceIn(0f, 1f)
+        return ((db - NOISE_FLOOR_DB) / (0f - NOISE_FLOOR_DB) * WAVEFORM_DISPLAY_GAIN).coerceIn(0f, 1f)
     }
 
 }
