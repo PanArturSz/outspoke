@@ -136,6 +136,89 @@ private object Names {
 }
 
 /**
+ * The stateful decode primitives the [InferenceRepository] chunked-TDT streaming path
+ * requires. Implemented by [ParakeetEngine]; extracted as a capability interface so the
+ * repository's streaming state machine (buffer management, chunk cadence, TDT state
+ * carry-over, flush) can be driven by a deterministic fake in JVM integration tests
+ * (see `FakeStreamingParakeet`) without ONNX inference.
+ */
+interface ChunkStreamingEngine {
+
+    /** A fresh TDT decoder state for a new utterance (zeroed LSTM + blank prev token). */
+    fun initialTdtState(): TdtState
+
+    /** Preprocess + encode [samples] (float32 in [-1, 1], 16 kHz); caller closes [OnnxTensor]. */
+    fun encodeBuffer(samples: FloatArray): Pair<OnnxTensor, Int>
+
+    /** Decode encoder frames `[frameStart, frameEnd)` of [encoderOut] from the carried [state]. */
+    fun decodeChunk(
+        encoderOut: OnnxTensor,
+        totalLength: Int,
+        frameStart: Int,
+        frameEnd: Int,
+        state: TdtState,
+    ): ChunkDecodeResult
+
+    /** Detokenise [tokens] to a string (SentencePiece-aware). */
+    fun detokenizeTokens(tokens: List<Int>): String
+
+    /** `true` when [tokenId] is a SentencePiece word-initial token (starts a new word). */
+    fun tokenStartsWord(tokenId: Int): Boolean
+
+    /** Bounded local word beam over `[startFrame, endFrame]` from [initialState]. */
+    fun localWordBeam(
+        encoderOut: OnnxTensor,
+        totalLength: Int,
+        startFrame: Int,
+        endFrame: Int,
+        initialState: FrameState,
+        beamWidth: Int = WordBeamTuning.BEAM_WIDTH,
+        topK: Int = WordBeamTuning.TOP_K_TOKENS,
+        maxSteps: Int = WordBeamTuning.MAX_BEAM_STEPS,
+        maxAlternatives: Int = WordBeamTuning.MAX_ALTERNATIVES,
+    ): List<WordAlternative>
+}
+
+/**
+ * Tuning knobs for the word-alternative capture (top-K token swaps + local word
+ * beam). Defaults for [ChunkStreamingEngine.localWordBeam]; shared by
+ * [ParakeetEngine] and its test fakes.
+ */
+object WordBeamTuning {
+    const val TOP_K_TOKENS = 3        // runner-up tokens captured per emission
+    const val BEAM_WIDTH = 8          // live states in the local word beam
+    const val MAX_BEAM_STEPS = 200    // joint-call cap per word beam
+    const val MAX_ALTERNATIVES = 5    // word hypotheses returned per beam
+}
+
+/**
+ * Result of a streaming [ChunkStreamingEngine.decodeChunk]: the chunk's token IDs, the
+ * updated [TdtState], the chunk's confidence accumulators, and per-emission acoustic
+ * evidence.
+ *
+ * [logProbSum] is the sum of per-emission log-softmax probabilities (non-blank tokens
+ * only) and [emissionCount] the count of those emissions. The caller accumulates both
+ * across chunks and computes the utterance confidence as
+ * `exp(totalLogProbSum / totalEmissions)` — the geometric mean of every token's
+ * probability. Summing log-probs (rather than averaging per-chunk confidences) is what
+ * makes the combined score independent of how the audio is chunked.
+ *
+ * [emissions] carries, per non-blank emission, the token, its frame index, its
+ * log-prob, and the top-K acoustic runner-up tokens — the evidence the word-alternative
+ * capture (top-K token swaps + local word beam) needs. [stateSnapshots] carries the
+ * decoder state at each emitting joint call so [ChunkStreamingEngine.localWordBeam] can
+ * re-start from the exact state the greedy decode had at a word's first token.
+ */
+data class ChunkDecodeResult(
+    val tokens: List<Int>,
+    val state: TdtState,
+    val logProbSum: Double,
+    val emissionCount: Int,
+    val emissions: List<TokenEmission>,
+    val stateSnapshots: List<FrameState>,
+)
+
+/**
  * Wraps the three Parakeet-V3 ONNX sessions.
  *
  * Pipeline (all tensor names verified from device logcat):
@@ -145,7 +228,7 @@ private object Names {
  *  4. greedy TDT     →  token IDs via decoder_joint with LSTM state carry-over
  *  5. detokenise     →  string via vocab.txt
  */
-class ParakeetEngine : SpeechEngine {
+class ParakeetEngine : SpeechEngine, ChunkStreamingEngine {
 
     private var env: OrtEnvironment? = null
     private var prepSession: OrtSession? = null
@@ -306,13 +389,15 @@ class ParakeetEngine : SpeechEngine {
     companion object {
         /**
          * Tuning knobs for the word-alternative capture (top-K token swaps + local word
-         * beam). All are exposed as parameters on the public functions so callers (the
-         * repository, tests) can override them without structural change.
+         * beam). Defaults for [localWordBeam]; aliases of [WordBeamTuning] so the
+         * interface keeps a single source of truth. All are exposed as parameters on the
+         * public functions so callers (the repository, tests) can override them without
+         * structural change.
          */
-        const val TOP_K_TOKENS = 3        // runner-up tokens captured per emission
-        const val BEAM_WIDTH = 8          // live states in the local word beam
-        const val MAX_BEAM_STEPS = 200    // joint-call cap per word beam
-        const val MAX_ALTERNATIVES = 5    // word hypotheses returned per beam
+        const val TOP_K_TOKENS = WordBeamTuning.TOP_K_TOKENS
+        const val BEAM_WIDTH = WordBeamTuning.BEAM_WIDTH
+        const val MAX_BEAM_STEPS = WordBeamTuning.MAX_BEAM_STEPS
+        const val MAX_ALTERNATIVES = WordBeamTuning.MAX_ALTERNATIVES
     }
 
     /**
@@ -322,7 +407,7 @@ class ParakeetEngine : SpeechEngine {
      * collapse to empty output. Use this to start a new streaming session (the first chunk
      * of an utterance).
      */
-    fun initialTdtState(): TdtState = TdtState(FloatArray(2 * 640), FloatArray(2 * 640), blankId)
+    override fun initialTdtState(): TdtState = TdtState(FloatArray(2 * 640), FloatArray(2 * 640), blankId)
 
     /**
      * Preprocesses + encodes [samples] (float32 in [-1, 1], 16 kHz) and returns the encoder
@@ -335,7 +420,7 @@ class ParakeetEngine : SpeechEngine {
      *
      * @throws IllegalStateException if the engine is not loaded.
      */
-    fun encodeBuffer(samples: FloatArray): Pair<OnnxTensor, Int> {
+    override fun encodeBuffer(samples: FloatArray): Pair<OnnxTensor, Int> {
         check(isLoaded) { "Engine not loaded; call load() first" }
         val e = env!!
         val (feats, featLen) = preprocess(e, samples)
@@ -344,31 +429,6 @@ class ParakeetEngine : SpeechEngine {
         return encOut to encLen
     }
 
-    /**
-     * Result of a streaming [decodeChunk]: the chunk's token IDs, the updated [TdtState],
-     * the chunk's confidence accumulators, and the per-emission acoustic evidence.
-     *
-     * [logProbSum] is the sum of per-emission log-softmax probabilities (non-blank tokens
-     * only) and [emissionCount] the count of those emissions. The caller accumulates both
-     * across chunks and computes the utterance confidence as
-     * `exp(totalLogProbSum / totalEmissions)` — the geometric mean of every token's
-     * probability. Summing log-probs (rather than averaging per-chunk confidences) is what
-     * makes the combined score independent of how the audio was chunked.
-     *
-     * [emissions] carries, per non-blank emission, the token, its frame index, its
-     * log-prob, and the top-K acoustic runner-up tokens — the evidence the word-alternative
-     * capture (top-K token swaps + local word beam) needs. [stateSnapshots] carries the
-     * decoder state at each emitting joint call so [localWordBeam] can re-start from the
-     * exact state the greedy decode had at a word's first token.
-     */
-    data class ChunkDecodeResult(
-        val tokens: List<Int>,
-        val state: TdtState,
-        val logProbSum: Double,
-        val emissionCount: Int,
-        val emissions: List<TokenEmission>,
-        val stateSnapshots: List<FrameState>,
-    )
 
     /**
      * Decodes encoder frames `[frameStart, frameEnd)` of [encoderOut] starting from the
@@ -383,7 +443,7 @@ class ParakeetEngine : SpeechEngine {
      *
      * @throws IllegalStateException if the engine is not loaded.
      */
-    fun decodeChunk(
+    override fun decodeChunk(
         encoderOut: OnnxTensor,
         totalLength: Int,
         frameStart: Int,
@@ -403,14 +463,14 @@ class ParakeetEngine : SpeechEngine {
      * the streaming path, which accumulates tokens across chunks and detokenises the running
      * total for each partial.
      */
-    fun detokenizeTokens(tokens: List<Int>): String = detokenize(tokens)
+    override fun detokenizeTokens(tokens: List<Int>): String = detokenize(tokens)
 
     /**
      * Returns `true` when [tokenId] is a SentencePiece word-initial token (its vocabulary
      * entry starts with the `▁` word-boundary marker). Used by the repository to segment
      * per-chunk emissions into words for acoustic-alternative capture.
      */
-    fun tokenStartsWord(tokenId: Int): Boolean {
+    override fun tokenStartsWord(tokenId: Int): Boolean {
         if (tokenId < 0 || tokenId >= vocabulary.size || tokenId == blankId) return false
         return vocabulary[tokenId].startsWith("▁")
     }
@@ -434,16 +494,16 @@ class ParakeetEngine : SpeechEngine {
      *
      * @throws IllegalStateException if the engine is not loaded.
      */
-    fun localWordBeam(
+    override fun localWordBeam(
         encoderOut: OnnxTensor,
         totalLength: Int,
         startFrame: Int,
         endFrame: Int,
         initialState: FrameState,
-        beamWidth: Int = BEAM_WIDTH,
-        topK: Int = TOP_K_TOKENS,
-        maxSteps: Int = MAX_BEAM_STEPS,
-        maxAlternatives: Int = MAX_ALTERNATIVES,
+        beamWidth: Int,
+        topK: Int,
+        maxSteps: Int,
+        maxAlternatives: Int,
     ): List<WordAlternative> {
         check(isLoaded) { "Engine not loaded; call load() first" }
         val e = env!!

@@ -163,13 +163,25 @@ private fun TranscriptResult.logLabel(): String = when (this) {
 }
 
 /**
+ * Longest phrase (in words) considered a model stutter/duplication. Genuine
+ * repeated speech of 9+ words is treated as content and kept. Capping the
+ * candidate length also keeps [collapseRepeatedPhrases] near-linear in the
+ * transcript length (bounded candidate lengths × bounded zip per position), so
+ * re-running the cleaning pipeline over the whole utterance on every chunk of a
+ * long dictation does not grow cubic and break the streaming path's real-time
+ * budget.
+ */
+private const val MAX_REPEATED_PHRASE_WORDS = 8
+
+/**
  * Collapses consecutive repeated phrases (including single words) that the model
  * hallucinated or duplicated.
  *
- * Works left-to-right: at each position it finds the longest phrase (length ≥ 1)
- * starting there that is immediately followed by one or more identical copies
- * (case-insensitive, punctuation-stripped comparison via [normalizedForComparison]).
- * All copies beyond the first are dropped.
+ * Works left-to-right: at each position it finds the longest phrase (length 1..
+ * [MAX_REPEATED_PHRASE_WORDS]) starting there that is immediately followed by one
+ * or more identical copies (case-insensitive, punctuation-stripped comparison via
+ * [normalizedForComparison]). All copies beyond the first are dropped. Repetitions
+ * of longer phrases are kept (see [MAX_REPEATED_PHRASE_WORDS]).
  *
  * Examples:
  *   "gut gut aus"                                     → "gut aus"
@@ -189,9 +201,8 @@ internal fun String.collapseRepeatedPhrases(): String {
         var foundRepeat = false
 
         // Try phrase lengths from largest possible down to 1 (single word).
-        for (len in (remaining / 2) downTo 1) {
-            if (i + len * 2 > words.size) continue
-
+        // Bounded by [MAX_REPEATED_PHRASE_WORDS] so the scan stays near-linear.
+        for (len in minOf(MAX_REPEATED_PHRASE_WORDS, remaining / 2) downTo 1) {
             val phrase = words.subList(i, i + len)
             val nextPhrase = words.subList(i + len, i + len * 2)
 
@@ -1330,11 +1341,12 @@ class InferenceRepository(
         postprocessingEnabled: Boolean = true,
         formatNumbersAsDigits: Boolean = true,
     ): Flow<TranscriptResult> = channelFlow<TranscriptResult> {
-        // The chunked-TDT streaming path requires the Parakeet engine's stateful decode
-        // primitives. If a non-Parakeet engine is configured we fall back to the legacy
-        // whole-window re-transcription path (kept below) so the repository stays functional.
-        val parakeet = engine as? ParakeetEngine
-        if (parakeet == null) {
+        // The chunked-TDT streaming path requires the [ChunkStreamingEngine] stateful
+        // decode primitives (implemented by ParakeetEngine). If a non-streaming engine is
+        // configured we fall back to the legacy whole-window re-transcription path (kept
+        // below) so the repository stays functional.
+        val streaming = engine as? ChunkStreamingEngine
+        if (streaming == null) {
             legacyTranscribe(audio, postprocessingEnabled, formatNumbersAsDigits).collect { send(it) }
             return@channelFlow
         }
@@ -1358,7 +1370,7 @@ class InferenceRepository(
         // left-context start is never read again and is trimmed from the front so a long
         // dictation does not grow the buffer without bound (30 min ≈ 57 MB unbounded).
         var bufferStart = 0
-        var state = parakeet.initialTdtState()
+        var state = streaming.initialTdtState()
         val allTokens = mutableListOf<Int>()
         var nextChunkStart = 0
         // Per-utterance confidence accumulators: the sum of per-emission log-softmax
@@ -1441,13 +1453,13 @@ class InferenceRepository(
             val tokenCount = wordEmissions.size
             val logProbSum = wordEmissions.sumOf { it.logProb }
             val candidates = HashMap<String, Double>()
-            candidates[parakeet.detokenizeTokens(wordEmissions.map { it.token })] = logProbSum / tokenCount
+            candidates[streaming.detokenizeTokens(wordEmissions.map { it.token })] = logProbSum / tokenCount
             val baseTokens = wordEmissions.map { it.token }.toMutableList()
             for (i in wordEmissions.indices) {
                 for (alt in wordEmissions[i].topTokens) {
                     if (alt.token == wordEmissions[i].token) continue
                     baseTokens[i] = alt.token
-                    val swappedText = parakeet.detokenizeTokens(baseTokens)
+                    val swappedText = streaming.detokenizeTokens(baseTokens)
                     baseTokens[i] = wordEmissions[i].token
                     if (swappedText.isBlank()) continue
                     val swappedNorm = (logProbSum - wordEmissions[i].logProb + alt.logProb) / tokenCount
@@ -1482,7 +1494,7 @@ class InferenceRepository(
             val wordEmissions = pendingEmissions
             if (wordEmissions.isEmpty()) return
             pendingEmissions = emptyList()
-            val wordText = parakeet.detokenizeTokens(wordEmissions.map { it.token })
+            val wordText = streaming.detokenizeTokens(wordEmissions.map { it.token })
             if (wordText.isBlank() || wordText.length < 2) return
             cacheCandidates(wordText, tokenSwapCandidates(wordEmissions))
         }
@@ -1504,7 +1516,7 @@ class InferenceRepository(
         // token's decoder-state snapshot lives in this chunk's [decoded.stateSnapshots]);
         // words continued from a previous chunk get token-swap candidates only.
         fun captureAcousticCandidates(
-            decoded: ParakeetEngine.ChunkDecodeResult,
+            decoded: ChunkDecodeResult,
             encOut: OnnxTensor,
             encLen: Int,
         ) {
@@ -1514,7 +1526,7 @@ class InferenceRepository(
             val segments = ArrayList<List<TokenEmission>>()
             val current = ArrayList<TokenEmission>()
             for (em in decoded.emissions) {
-                if (current.isNotEmpty() && parakeet.tokenStartsWord(em.token)) {
+                if (current.isNotEmpty() && streaming.tokenStartsWord(em.token)) {
                     segments.add(current.toList())   // copy — [current] is reused below
                     current.clear()
                 }
@@ -1550,7 +1562,7 @@ class InferenceRepository(
             var beamsUsed = 0
             for (idx in completed.indices) {
                 val wordEmissions = completed[idx]
-                val wordText = parakeet.detokenizeTokens(wordEmissions.map { it.token })
+                val wordText = streaming.detokenizeTokens(wordEmissions.map { it.token })
                 if (wordText.isBlank() || wordText.length < 2) continue
                 val tokenCount = wordEmissions.size
                 val logProbSum = wordEmissions.sumOf { it.logProb }
@@ -1575,7 +1587,7 @@ class InferenceRepository(
                         beamsUsed++
                         val beamEnd = (lastFrame + BEAM_FRAME_MARGIN).coerceAtMost(encLen - 1)
                         try {
-                            for (alt in parakeet.localWordBeam(encOut, encLen, firstFrame, beamEnd, snapshot)) {
+                            for (alt in streaming.localWordBeam(encOut, encLen, firstFrame, beamEnd, snapshot)) {
                                 if (alt.acousticLogProb > candidates.getOrDefault(alt.word, Double.NEGATIVE_INFINITY)) {
                                     candidates[alt.word] = alt.acousticLogProb.toDouble()
                                 }
@@ -1598,7 +1610,7 @@ class InferenceRepository(
             val bufEnd = minOf(rightEnd, totalSamples)
             if (bufEnd <= bufStart) return
             val (encOut, encLen) = try {
-                parakeet.encodeBuffer(extractRange(bufStart, bufEnd))
+                streaming.encodeBuffer(extractRange(bufStart, bufEnd))
             } catch (ex: Exception) {
                 recordStreamFailure(ex, chunkStart, chunkEnd)
                 return
@@ -1620,7 +1632,7 @@ class InferenceRepository(
                 // position map correctly selects the chunk's end frame within the buffer.
                 val chunkReachesBufferEnd = (chunkEnd - bufStart) >= (bufEnd - bufStart)
                 val fLC = if (chunkReachesBufferEnd) encLen else minOf(frameOffset(chunkEnd - bufStart), encLen)
-                val decoded = parakeet.decodeChunk(
+                val decoded = streaming.decodeChunk(
                     encOut, encLen, fL, if (fLC <= fL) encLen else fLC, state
                 )
                 state = decoded.state
@@ -1654,7 +1666,7 @@ class InferenceRepository(
         // sentence-final period and lower-casing the next word.
         suspend fun emitPartial() {
             if (allTokens.isEmpty()) return
-            val raw = parakeet.detokenizeTokens(allTokens)
+            val raw = streaming.detokenizeTokens(allTokens)
             if (raw.isBlank()) return
             val cleaned = if (postprocessingEnabled)
                 raw.cleanTranscript(
@@ -1725,7 +1737,7 @@ class InferenceRepository(
                 // The utterance is over — complete the pending word (token swaps only).
                 flushPendingWordCandidates()
                 if (streamFailure != null) return "" to 0f
-                return parakeet.detokenizeTokens(allTokens) to utteranceConfidence()
+                return streaming.detokenizeTokens(allTokens) to utteranceConfidence()
             }
 
             // Restores the session-start decode state and re-decodes the original buffer
@@ -1740,7 +1752,7 @@ class InferenceRepository(
                 buffer.addAll(savedBuffer)
                 bufferStart = 0
                 totalSamples = savedTotalSamples + if (withLead) SHORT_UTT_LEAD_SILENCE_SAMPLES else 0
-                state = parakeet.initialTdtState()
+                state = streaming.initialTdtState()
                 allTokens.clear()
                 totalLogProbSum = 0.0
                 totalEmissions = 0
@@ -1839,7 +1851,7 @@ class InferenceRepository(
                 buffer.clear()
                 totalSamples = 0
                 bufferStart = 0
-                state = parakeet.initialTdtState()
+                state = streaming.initialTdtState()
                 allTokens.clear()
                 nextChunkStart = 0
                 totalLogProbSum = 0.0
