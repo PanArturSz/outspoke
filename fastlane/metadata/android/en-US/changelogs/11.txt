@@ -1,0 +1,5 @@
+Eighth patch (v0.3.1).
+
+Fixed a stall in long dictations: after 30-45 seconds of continuous speaking, transcription could freeze and stop updating. The per-chunk post-processing cost now stays bounded, so text keeps flowing for long sessions and fast speech no longer drops content.
+
+The waveform bar is more visible: the amplitude display gain is increased, so typical speech fills the bar.

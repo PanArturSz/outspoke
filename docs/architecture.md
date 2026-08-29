@@ -61,7 +61,7 @@ Single Gradle module (app). All Kotlin source lives under app/src/main/kotlin/ (
 | Package | Key files | Responsibility |
 |---|---|---|
 | audio | AudioCaptureManager, MicCalibrationManager, SileroVadFilter, RMSVadFilter, VadFilter, AudioChunk, PermissionHelper | Mic capture, PCM chunking, Voice Activity Detection, optional mic calibration |
-| inference | SpeechEngine, ParakeetEngine, WhisperEngine, VoxtralEngine, SpeechEngineFactory, InferenceRepository, InferenceService, TranscriptResult, EngineState, PipelineDiagnostics, NumberNormaliser, GrammarCorrector, AcousticCandidates | ASR pipeline, sliding window, post-processing, foreground service, acoustic word-alternative capture |
+| inference | SpeechEngine, ParakeetEngine, ChunkStreamingEngine, WhisperEngine, VoxtralEngine, SpeechEngineFactory, InferenceRepository, InferenceService, TranscriptResult, EngineState, PipelineDiagnostics, NumberNormaliser, GrammarCorrector, AcousticCandidates | ASR pipeline, sliding window, post-processing, foreground service, acoustic word-alternative capture |
 | ime | OutspokeInputMethodService, TextInjector, TranscriptAligner, EnterAction, WordSuggestionProvider | Keyboard service, composing text management, alignment, word-correction facade |
 | ime/correction | WordCorrector, CandidateGenerator, ArpaLanguageModel, SuggestionFileDownloader, SuggestionFileManager, SuggestionLanguage, DoubleMetaphone, KolnerPhonetik, EditDistance | On-device word correction + downloadable language pack management |
 | settings/model | ModelId, ModelRegistry, ModelDownloadManager, ModelStorageManager, ModelState, ModelViewModel, DownloadService | Model enumeration, download, SHA-256 verification, on-disk paths |
@@ -463,7 +463,7 @@ InferenceService watches <filesDir>/models/ for CLOSE_WRITE / MOVED_TO events. W
 ## 13. Build Configuration and ABI Splits
 
 - compileSdk 36, minSdk 30 (Android 11+), targetSdk 36
-- versionCode 10, versionName 0.3.0
+- versionCode 11, versionName 0.3.1
 - Kotlin 2.3.20, AGP 8.13.2, JVM target 11
 - buildFeatures: compose = true, buildConfig = true
 - Release: isMinifyEnabled = true, isShrinkResources = true, ProGuard enabled

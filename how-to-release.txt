@@ -1,3 +1,2 @@
 The tag must match versionName in app/build.gradle.kts (without the "v").
-
-git tag v0.3.0 && git push origin v0.3.0
+git tag v0.3.1 && git push origin v0.3.1
