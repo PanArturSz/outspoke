@@ -60,5 +60,6 @@ class UserDictionaryTest {
         assertEquals("Claude, Cowork, Anthropic", d.apply("Clot, Cowork, Antropic"))
         assertEquals("Spotkanie z PKO BP, ASZSTRATEGY", d.apply("Spotkanie z PKOBP, ASZ Strategy"))
         assertEquals("Claude Code i Claude Cowork", d.apply("Clode Code i Claude Cowork"))
+        assertEquals("Claude Code, Bitwarden, Google Kalendarz, Google Tasks, śmiga", d.apply("Clotkoad, Bitvarden, Google Kalendar, Google Task, ćwiga"))
     }
 }

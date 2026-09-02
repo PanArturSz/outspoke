@@ -82,7 +82,7 @@ class UserDictionary private constructor(
 
 # --- przekręcenia, które model robi po polsku
 klot | clot | klod | klaud | claud | clode | klode | kloud => Claude
-klot kot | clot code | klod kod | klaud kod | claud code | cloud code | clode code | klode kod | kod klot => Claude Code
+klot kot | clot code | klod kod | klaud kod | claud code | cloud code | clode code | klode kod | kod klot | clotkoad | clot koad | klotkoad | clotcode | clot kod => Claude Code
 klot kowork | clot cowork | klod kowork | claude kowork => Claude Cowork
 kowork | kołork | co work => Cowork
 antropic | entropic | antropik | anthropik | antropiq => Anthropic
@@ -92,6 +92,11 @@ sinkting | synk sing | syncing => Syncthing
 łispr flow | wisper flow | whisper flow => Wispr Flow
 parakit | parakiet => Parakeet
 autspołk | outspok => Outspoke
+bitvarden | bit warden | bitłarden | bitworden => Bitwarden
+voltvarden | volt warden | wolt warden => Vaultwarden
+google kalendar | gugle kalendarz | gugiel kalendarz => Google Kalendarz
+google task | google taski | gugle taski => Google Tasks
+ćwiga => śmiga
 
 # --- firma i ludzie
 ASZSTRATEGY
@@ -155,6 +160,12 @@ API
 RAG
 MCP
 Snapdragon
+Bitwarden
+Vaultwarden
+Google Tasks
+Google Kalendarz
+Termius
+NetBird
 
 # --- granty i regulacje
 HORIZON

@@ -5,6 +5,10 @@ on:
     branches: [ "asz" ]
   workflow_dispatch:
 
+concurrency:
+  group: asz-apk
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
