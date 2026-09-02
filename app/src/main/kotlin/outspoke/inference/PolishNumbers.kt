@@ -168,10 +168,34 @@ internal object PolishNumbers {
     private fun looksLikeNumberWord(t: Tok): Boolean =
         t.core.any { it.isDigit() } || isCardinal(t)
 
+    /** Po zaimku „one" (rodzaj niemęskoosobowy) stoi czasownik w liczbie mnogiej albo partykuła. */
+    private val AFTER_ONE = setOf(
+        "to", "są", "były", "będą", "mają", "mogą", "chcą", "wiedzą", "muszą", "same", "też", "również",
+        "wszystkie", "nie", "się", "już", "jeszcze", "tam", "tu", "nas", "mnie", "ci", "ciebie", "go",
+        "obie", "obydwie", "tylko", "zawsze", "nigdy", "właśnie", "jednak", "przecież", "chyba", "wciąż",
+    )
+
     private fun tenToDemonstrative(toks: List<Tok>): List<Tok> {
         val out = toks.toMutableList()
         for (i in toks.indices) {
             val t = toks[i]
+            // „1" zamiast „one": model słyszy angielskie „one".
+            if (t.core == "1" && t.prefix.isEmpty() && (t.suffix.isEmpty() || t.suffix == ",")) {
+                val prev = toks.getOrNull(i - 1)
+                val next = toks.getOrNull(i + 1)
+                val prevOk = prev == null || !(looksLikeNumberWord(prev) || prev.lower in BEFORE_NUMBER)
+                if (prevOk && next != null && next.prefix.isEmpty() && !looksLikeNumberWord(next)) {
+                    val n = next.lower
+                    val pronoun = n.all { it.isLetter() } && (
+                        n in AFTER_ONE || (n.length > 3 && (n.endsWith("ą") || n.endsWith("ły")))
+                    )
+                    if (pronoun) {
+                        val word = if (prev != null && prev.suffix.endsWith(".")) "One" else "one"
+                        out[i] = Tok(t.prefix, word, t.suffix)
+                        continue
+                    }
+                }
+            }
             if (t.core != "10" || t.prefix.isNotEmpty()) continue
             if (t.suffix.isNotEmpty() && t.suffix != ",") continue
             val prev = toks.getOrNull(i - 1)

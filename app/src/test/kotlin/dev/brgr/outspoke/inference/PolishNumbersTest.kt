@@ -48,6 +48,16 @@ class PolishNumbersTest {
     }
 
     @Test
+    fun `1 zamiast one wraca do zaimka`() {
+        assertEquals("do Ani, one to zrozumieją", n("do Ani, 1 to zrozumieją"))
+        assertEquals("one były tam", n("1 były tam"))
+        assertEquals("one się uśmiechną", n("1 się uśmiechną"))
+        assertEquals("mam 1 pytanie", n("mam 1 pytanie"))
+        assertEquals("strona 1 i 2", n("strona 1 i 2"))
+        assertEquals("o 1 w nocy", n("o 1 w nocy"))
+    }
+
+    @Test
     fun `10 zostaje liczbą, gdy jest liczbą`() {
         assertEquals("mam 10 minut", n("mam 10 minut"))
         assertEquals("o 10 rano", n("o 10 rano"))

@@ -97,6 +97,8 @@ voltvarden | volt warden | wolt warden => Vaultwarden
 google kalendar | gugle kalendarz | gugiel kalendarz => Google Kalendarz
 google task | google taski | gugle taski => Google Tasks
 ćwiga => śmiga
+gramatli | gramarli | gramadly | gramerly | gramatly | gramaly => Grammarly
+langłicz tul | language tool | lengłidż tul => LanguageTool
 
 # --- firma i ludzie
 ASZSTRATEGY
@@ -160,6 +162,8 @@ API
 RAG
 MCP
 Snapdragon
+Grammarly
+LanguageTool
 Bitwarden
 Vaultwarden
 Google Tasks
