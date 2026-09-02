@@ -479,6 +479,18 @@ class OutspokeInputMethodService :
      */
     override fun onEvaluateFullscreenMode(): Boolean = false
 
+    /**
+     * ASZ: przy podłączonej klawiaturze fizycznej (tablet + Bluetooth) Android domyślnie chowa
+     * widok klawiatury ekranowej — a bez niego nie ma przycisku mikrofonu. Klawiatura głosowa
+     * ma sens właśnie obok fizycznej, więc pokazujemy widok zawsze.
+     */
+    override fun onEvaluateInputViewShown(): Boolean {
+        super.onEvaluateInputViewShown()
+        return true
+    }
+
+    override fun onShowInputRequested(flags: Int, configChange: Boolean): Boolean = true
+
     override fun onFinishInputView(finishingInput: Boolean) {
         Log.d(TAG, "onFinishInputView finishingInput=$finishingInput barVisible=$barVisible")
         super.onFinishInputView(finishingInput)
