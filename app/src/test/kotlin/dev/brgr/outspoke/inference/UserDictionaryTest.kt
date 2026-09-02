@@ -14,7 +14,7 @@ class UserDictionaryTest {
         assertEquals("Claude Code", d.apply("claude code"))
         assertEquals("Claude Code", d.apply("ClaudeCode"))
         assertEquals("Claude Code", d.apply("claude-code"))
-        assertEquals("Użyj Claude Code teraz", d.apply("użyj claude   code teraz"))
+        assertEquals("użyj Claude Code teraz", d.apply("użyj claude   code teraz"))
     }
 
     @Test
