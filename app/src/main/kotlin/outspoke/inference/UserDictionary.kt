@@ -210,6 +210,8 @@ clotcowk | clot cowk | clotkowork | clot kowk => Claude Cowork
 to doist | tudoist | tu doist => Todoist
 Todoist
 eact | e act | ej akt | ai akt | aj akt => AI Act
+bidwarden | bidłarden | bit varden => Bitwarden
+clotcowerk | clot cowerk | clotkowerk | clot kowerk | klotkowerk => Claude Cowork
 
 """
     }
