@@ -92,7 +92,8 @@ klot kot | clot code | klod kod | klaud kod | claud code | cloud code | clode co
 klot kowork | clot cowork | klod kowork | claude kowork => Claude Cowork
 kowork | kołork | co work => Cowork
 antropic | entropic | antropik | anthropik | antropiq => Anthropic
-asz strategy | as strategy | asz strategi | aż strategy | a s z strategy => ASZSTRATEGY
+asz strategy | as strategy | asz strategi | aż strategy | a s z strategy | aszstrategy | asz-strategy => ASZSTRATEGY
+cuk ubezpieczenia | cók ubezpieczenia | cuk ubezpieczenie => CUK Ubezpieczenia
 obsydian | obsidien | obsydien => Obsidian
 sinkting | synk sing | syncing => Syncthing
 łispr flow | wisper flow | whisper flow => Wispr Flow
@@ -111,6 +112,8 @@ langłicz tul | language tool | lengłidż tul => LanguageTool
 
 # --- firma i ludzie
 ASZSTRATEGY
+CUK Ubezpieczenia
+CUK
 ASZ Digital
 ASZ Partners
 ASZ Digital Health
