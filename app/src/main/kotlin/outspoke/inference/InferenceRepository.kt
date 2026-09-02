@@ -739,7 +739,11 @@ internal fun String.cleanTranscript(
     val afterStutters = afterFillers.collapseStutters()
     if (afterStutters != afterFillers) Log.d(TAG, "[CLEAN:STUTTER]     ${afterFillers.length} → ${afterStutters.length} chars")
 
-    val afterNumbers = if (formatNumbersAsDigits) {
+    val afterNumbers = if (formatNumbersAsDigits && language.startsWith("pl", ignoreCase = true)) {
+        val joined = PolishNumbers.normalise(afterStutters)
+        if (joined != afterStutters) Log.d(TAG, "[CLEAN:NUMBERS:PL]  ${afterStutters.length} → ${joined.length} chars")
+        joined
+    } else if (formatNumbersAsDigits) {
         val words = afterStutters.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
         val normalised = NumberNormaliser.normalise(words, language)
         val joined = normalised.joinToString(" ")
