@@ -132,9 +132,73 @@ internal object PolishNumbers {
         return total + current
     }
 
+    // ── „10" zamiast „ten" ────────────────────────────────────────────────────
+    // Parakeet słyszy polskie „ten" jak angielskie „ten" i od razu pisze cyfrę. Odwracamy to,
+    // gdy „10" stoi tam, gdzie po polsku może stać tylko zaimek: bez liczby ani przyimka
+    // przed sobą i z rzeczownikiem/przymiotnikiem w mianowniku po sobie.
+
+    /** Słowa, które po liczbie 10 są normalne („10 minut") — wtedy cyfra zostaje. */
+    private val COUNTED = setOf(
+        "minut", "godzin", "sekund", "dni", "tygodni", "miesięcy", "lat", "osób", "ludzi", "sztuk",
+        "razy", "procent", "złotych", "zł", "euro", "dolarów", "tysięcy", "milionów", "miliardów",
+        "km", "kilometrów", "metrów", "centymetrów", "milimetrów", "gram", "gramów", "kilogramów", "kilo",
+        "ton", "litrów", "mil", "stopni", "stron", "punktów", "firm", "spółek", "spraw", "zmian",
+        "tabel", "kolumn", "linii", "wersji", "kroków", "notatek", "kobiet", "mężczyzn", "dzieci",
+        "rzeczy", "umów", "decyzji", "wiadomości", "maili", "plików", "zadań", "projektów", "spotkań",
+        "rozmów", "pytań", "zdań", "słów", "znaków", "cyfr", "liczb", "urządzeń", "aplikacji",
+        "modeli", "agentów", "sesji", "promptów", "tokenów", "sekcji", "akapitów", "slajdów", "pozycji",
+        "elementów", "kategorii", "tematów", "zespołów", "pracowników", "klientów", "uczestników",
+        "głosów", "miejsc", "egzemplarzy", "mln", "mld", "tys", "proc", "min", "sek", "godz", "szt",
+    )
+    /** Po tych słowach „10" jest liczbą („o 10", „ponad 10"). */
+    private val BEFORE_NUMBER = setOf(
+        "o", "do", "od", "po", "przed", "około", "koło", "na", "za", "przez", "ponad", "prawie",
+        "jakieś", "z", "ze", "niż", "nad", "pod", "między", "plus", "minus", "razy", "i", "oraz",
+    )
+    /** Przymiotniki i zaimki, które w mianowniku kończą się na -y/-i i stoją po „ten". */
+    private val AFTER_TEN_ADJ = setOf(
+        "sam", "nowy", "stary", "pierwszy", "drugi", "trzeci", "ostatni", "cały", "każdy", "jeden",
+        "mały", "duży", "wielki", "główny", "konkretny", "dobry", "zły", "inny", "kolejny", "następny",
+        "poprzedni", "ważny", "prosty", "trudny", "długi", "krótki", "szybki", "wolny", "gotowy",
+        "pełny", "pusty", "własny", "obecny", "dzisiejszy", "wczorajszy", "jutrzejszy", "jakiś",
+        "taki", "który", "mój", "twój", "nasz", "wasz", "jego", "jej", "ich", "cudzy", "dowolny",
+        "polski", "angielski", "cyfrowy", "głosowy", "tekstowy", "nowszy", "starszy", "lepszy", "gorszy",
+    )
+
+    private fun looksLikeNumberWord(t: Tok): Boolean =
+        t.core.any { it.isDigit() } || isCardinal(t)
+
+    private fun tenToDemonstrative(toks: List<Tok>): List<Tok> {
+        val out = toks.toMutableList()
+        for (i in toks.indices) {
+            val t = toks[i]
+            if (t.core != "10" || t.prefix.isNotEmpty()) continue
+            if (t.suffix.isNotEmpty() && t.suffix != ",") continue
+            val prev = toks.getOrNull(i - 1)
+            if (prev != null && (looksLikeNumberWord(prev) || prev.lower in BEFORE_NUMBER || prev.suffix.isEmpty().not() && prev.lower in BEFORE_NUMBER)) continue
+            val next = toks.getOrNull(i + 1) ?: continue
+            if (next.prefix.isNotEmpty() || looksLikeNumberWord(next)) continue
+            val n = next.lower
+            if (n.isEmpty() || !n.all { it.isLetter() }) continue
+            val demonstrative = when {
+                t.suffix == "," -> n.startsWith("kt")                    // „ten, który"
+                n in COUNTED -> false
+                n in AFTER_TEN_ADJ -> true
+                n.endsWith("ów") || n.endsWith("ek") || n.endsWith("ań") || n.endsWith("eń") -> false
+                n.endsWith("y") || n.endsWith("i") || n.endsWith("a") || n.endsWith("e") || n.endsWith("o") || n.endsWith("ę") || n.endsWith("ą") -> false
+                else -> true                                              // mianownik męski: „ten przycisk"
+            }
+            if (demonstrative) {
+                val word = if (i == 0 || (prev != null && prev.suffix.endsWith("."))) "Ten" else "ten"
+                out[i] = Tok(t.prefix, word, t.suffix)
+            }
+        }
+        return out
+    }
+
     fun normalise(text: String): String {
         if (text.isBlank()) return text
-        val toks = tokenize(text)
+        val toks = tenToDemonstrative(tokenize(text))
         val out = mutableListOf<String>()
         var i = 0
         while (i < toks.size) {
