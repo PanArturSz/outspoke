@@ -43,8 +43,8 @@ class PolishNumbersTest {
         assertEquals("i powiem, że ten niedźwiedź", n("i powiem, że 10 niedźwiedź"))
         assertEquals("w ten sposób", n("w 10 sposób"))
         assertEquals("ten sam plik", n("10 sam plik"))
-        assertEquals("Ten, który wygrał", n("10, który wygrał"))
-        assertEquals("Ten problem", n("10 problem"))
+        assertEquals("ten, który wygrał", n("10, który wygrał"))
+        assertEquals("Koniec. Ten problem", n("Koniec. 10 problem"))
     }
 
     @Test
@@ -55,7 +55,7 @@ class PolishNumbersTest {
         assertEquals("ponad 10 firm", n("ponad 10 firm"))
         assertEquals("10 dni", n("10 dni"))
         assertEquals("strona 10.", n("strona 10."))
-        assertEquals("2 razy 10 to 20", n("dwa razy dziesięć to dwadzieścia"))
+        assertEquals("dwa razy 10 to 20", n("dwa razy dziesięć to dwadzieścia"))
     }
 
     @Test

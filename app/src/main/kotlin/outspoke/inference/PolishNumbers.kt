@@ -175,7 +175,7 @@ internal object PolishNumbers {
             if (t.core != "10" || t.prefix.isNotEmpty()) continue
             if (t.suffix.isNotEmpty() && t.suffix != ",") continue
             val prev = toks.getOrNull(i - 1)
-            if (prev != null && (looksLikeNumberWord(prev) || prev.lower in BEFORE_NUMBER || prev.suffix.isEmpty().not() && prev.lower in BEFORE_NUMBER)) continue
+            if (prev != null && (looksLikeNumberWord(prev) || prev.lower in BEFORE_NUMBER)) continue
             val next = toks.getOrNull(i + 1) ?: continue
             if (next.prefix.isNotEmpty() || looksLikeNumberWord(next)) continue
             val n = next.lower
@@ -189,7 +189,8 @@ internal object PolishNumbers {
                 else -> true                                              // mianownik męski: „ten przycisk"
             }
             if (demonstrative) {
-                val word = if (i == 0 || (prev != null && prev.suffix.endsWith("."))) "Ten" else "ten"
+                // Wielką literę na początku zdania dokłada dalsza obróbka; tu tylko po kropce.
+                val word = if (prev != null && prev.suffix.endsWith(".")) "Ten" else "ten"
                 out[i] = Tok(t.prefix, word, t.suffix)
             }
         }
