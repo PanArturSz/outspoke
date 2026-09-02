@@ -70,7 +70,7 @@ class ParakeetLanguageTest {
         // ParakeetEngine is instantiated but never loaded — we only test the
         // setLanguage/currentLanguage contract, which requires no ONNX files.
         val engine = ParakeetEngine()
-        assertThat(engine.currentLanguage).isEqualTo("en")   // default before any call
+        assertThat(engine.currentLanguage).isEqualTo("pl")   // ASZ: domyślnie polski
 
         engine.setLanguage("de")
         assertThat(engine.currentLanguage).isEqualTo("de")
@@ -86,8 +86,8 @@ class ParakeetLanguageTest {
         assertThat(engine.currentLanguage).isEqualTo("de")
 
         engine.setLanguage("auto")
-        // "auto" → forcedLanguage = null → currentLanguage must return "en"
-        assertThat(engine.currentLanguage).isEqualTo("en")
+        // "auto" → forcedLanguage = null → currentLanguage must return "pl" (ASZ)
+        assertThat(engine.currentLanguage).isEqualTo("pl")
     }
 
     @Test
