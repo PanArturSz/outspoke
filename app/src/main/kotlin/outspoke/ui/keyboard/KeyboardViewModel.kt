@@ -12,6 +12,7 @@ import dev.brgr.outspoke.inference.EngineState
 import dev.brgr.outspoke.inference.InferenceRepository
 import dev.brgr.outspoke.inference.PipelineDiagnostics
 import dev.brgr.outspoke.inference.TranscriptResult
+import dev.brgr.outspoke.inference.UserDictionary
 import dev.brgr.outspoke.settings.preferences.AppPreferences
 import dev.brgr.outspoke.ui.keyboard.components.WHISPER_LANGUAGE_OPTIONS
 import kotlinx.coroutines.CancellationException
@@ -109,6 +110,33 @@ class KeyboardViewModel(
      */
     val postprocessingEnabled: StateFlow<Boolean> = appPreferences.postprocessingEnabled
         .stateIn(viewModelScope, SharingStarted.Eagerly, true)
+
+    /**
+     * Słownik nazw ASZ — korekta stosowana na każdym wyniku (częściowym i końcowym), niezależnie
+     * od tego, czy obróbka po transkrypcji jest włączona. Ta sama deterministyczna zamiana na
+     * obu rodzajach wyników trzyma [dev.brgr.outspoke.ime.TextInjector] w zgodzie z polem.
+     */
+    val userDictionary: StateFlow<UserDictionary> = appPreferences.userDictionaryRules
+        .map { UserDictionary.parse(it) }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, UserDictionary.parse(UserDictionary.DEFAULT_RULES))
+
+    private fun TranscriptResult.withUserDictionary(): TranscriptResult {
+        val dict = userDictionary.value
+        return when (this) {
+            is TranscriptResult.Partial -> {
+                val t = dict.apply(text)
+                if (t === text) this else copy(text = t)
+            }
+            is TranscriptResult.Final -> {
+                val t = dict.apply(text)
+                if (t === text) this else {
+                    Log.d(TAG, "[SLOWNIK] \"$text\" → \"$t\"")
+                    copy(text = t)
+                }
+            }
+            else -> this
+        }
+    }
 
     /**
      * Pipeline diagnostic counters for the current or most recent recording session.
@@ -493,7 +521,8 @@ class KeyboardViewModel(
                     ),
                     postprocessingEnabled = postprocessingEnabled.value,
                     formatNumbersAsDigits = formatNumbersAsDigits.value,
-                ).collect { result ->
+                ).collect { rawResult ->
+                    val result = rawResult.withUserDictionary()
                     // Stale-session guard: if this job has been superseded (e.g. the field
                     // was cleared and a new session started), discard this result entirely
                     // so no old-session text is injected into the fresh TextInjector.

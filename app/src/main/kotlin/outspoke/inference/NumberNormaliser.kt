@@ -133,7 +133,10 @@ internal object NumberNormaliser {
      */
     fun normalise(words: List<String>, language: String = "en"): List<String> {
         if (words.isEmpty()) return words
+        // ASZ: tabele są tylko angielskie i niemieckie. Dla innych języków nie ruszamy tekstu —
+        // po polsku „one" (zaimek) zamieniało się w „1".
         val isGerman = language.startsWith("de", ignoreCase = true)
+        if (!isGerman && !language.startsWith("en", ignoreCase = true)) return words
         val result = mutableListOf<String>()
         var i = 0
 

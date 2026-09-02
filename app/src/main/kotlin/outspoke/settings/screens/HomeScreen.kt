@@ -48,6 +48,7 @@ fun HomeScreen(
     onNavigateToInput: () -> Unit,
     onNavigateToSpeech: () -> Unit,
     onNavigateToTools: () -> Unit,
+    onNavigateToDictionary: () -> Unit,
 ) {
     val context = LocalContext.current
     val lifecycle = LocalLifecycleOwner.current.lifecycle
@@ -93,6 +94,7 @@ fun HomeScreen(
         onNavigateToInput = onNavigateToInput,
         onNavigateToSpeech = onNavigateToSpeech,
         onNavigateToTools = onNavigateToTools,
+        onNavigateToDictionary = onNavigateToDictionary,
     )
 }
 
@@ -107,6 +109,7 @@ private fun HomeScreenContent(
     onNavigateToInput: () -> Unit,
     onNavigateToSpeech: () -> Unit,
     onNavigateToTools: () -> Unit,
+    onNavigateToDictionary: () -> Unit,
 ) {
     Column(
         modifier = Modifier
@@ -185,6 +188,11 @@ private fun HomeScreenContent(
             icon = MyIcons.Settings,
             label = stringResource(R.string.home_pref_tools),
             onClick = onNavigateToTools,
+        )
+        ConfigurationButton(
+            icon = MyIcons.Keyboard,
+            label = stringResource(R.string.home_pref_dictionary),
+            onClick = onNavigateToDictionary,
         )
     }
 }
@@ -267,6 +275,7 @@ private fun HomeScreenNothingSetupPreview() {
             onNavigateToInput = {},
             onNavigateToSpeech = {},
             onNavigateToTools = {},
+            onNavigateToDictionary = {},
         )
     }
 }
@@ -285,6 +294,7 @@ private fun HomeScreenAllReadyPreview() {
             onNavigateToInput = {},
             onNavigateToSpeech = {},
             onNavigateToTools = {},
+            onNavigateToDictionary = {},
         )
     }
 }
@@ -303,6 +313,7 @@ private fun HomeScreenPartialSetupPreview() {
             onNavigateToInput = {},
             onNavigateToSpeech = {},
             onNavigateToTools = {},
+            onNavigateToDictionary = {},
         )
     }
 }

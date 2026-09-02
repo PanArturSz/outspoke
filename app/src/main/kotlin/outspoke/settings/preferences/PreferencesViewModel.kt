@@ -56,6 +56,16 @@ class PreferencesViewModel(application: Application) : AndroidViewModel(applicat
         viewModelScope.launch { prefs.setVadSensitivity(enabled) }
     }
 
+    val userDictionaryRules: StateFlow<String> = prefs.userDictionaryRules.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5_000),
+        initialValue = dev.brgr.outspoke.inference.UserDictionary.DEFAULT_RULES,
+    )
+
+    fun setUserDictionaryRules(rules: String) {
+        viewModelScope.launch { prefs.setUserDictionaryRules(rules) }
+    }
+
     val postprocessingEnabled: StateFlow<Boolean> = prefs.postprocessingEnabled.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5_000),

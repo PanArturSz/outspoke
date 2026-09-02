@@ -9,6 +9,7 @@
     <string name="nav_title_input">Microphone &amp; Trigger</string>
     <string name="nav_title_speech">Speech Processing</string>
     <string name="nav_title_tools">Tools</string>
+    <string name="nav_title_dictionary">Słownik nazw ASZ</string>
 
     <!-- Common actions -->
     <string name="action_open_settings">Open Settings</string>
@@ -45,6 +46,7 @@
     <!-- Home screen -->
     <string name="home_section_setup">Setup</string>
     <string name="home_section_configuration">Configuration</string>
+    <string name="home_pref_dictionary">Słownik nazw ASZ</string>
     <string name="home_ime_enabled">Keyboard enabled</string>
     <string name="home_ime_not_enabled">Keyboard not enabled</string>
     <string name="home_ime_enabled_subtitle">Outspoke is in the keyboard list.</string>

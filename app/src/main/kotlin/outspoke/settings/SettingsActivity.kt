@@ -25,6 +25,7 @@ import dev.brgr.outspoke.settings.model.ModelStorageManager
 import dev.brgr.outspoke.settings.screens.HomeScreen
 import dev.brgr.outspoke.settings.screens.InputPreferencesScreen
 import dev.brgr.outspoke.settings.screens.MicCalibrationScreen
+import dev.brgr.outspoke.settings.screens.DictionaryScreen
 import dev.brgr.outspoke.settings.screens.ModelScreen
 import dev.brgr.outspoke.settings.screens.SpeechPreferencesScreen
 import dev.brgr.outspoke.settings.screens.ToolsPreferencesScreen
@@ -58,6 +59,7 @@ object SettingsRoutes {
     const val PREF_SPEECH = "pref_speech"
     const val PREF_TOOLS = "pref_tools"
     const val CALIBRATION = "calibration"
+    const val DICTIONARY = "dictionary"
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -72,6 +74,7 @@ private fun SettingsNavHost(navController: NavHostController) {
         SettingsRoutes.PREF_INPUT -> stringResource(R.string.nav_title_input)
         SettingsRoutes.PREF_SPEECH -> stringResource(R.string.nav_title_speech)
         SettingsRoutes.PREF_TOOLS -> stringResource(R.string.nav_title_tools)
+        SettingsRoutes.DICTIONARY -> stringResource(R.string.nav_title_dictionary)
         else -> stringResource(R.string.app_name)
     }
 
@@ -110,6 +113,7 @@ private fun SettingsNavHost(navController: NavHostController) {
                     onNavigateToInput = { navController.navigate(SettingsRoutes.PREF_INPUT) },
                     onNavigateToSpeech = { navController.navigate(SettingsRoutes.PREF_SPEECH) },
                     onNavigateToTools = { navController.navigate(SettingsRoutes.PREF_TOOLS) },
+                    onNavigateToDictionary = { navController.navigate(SettingsRoutes.DICTIONARY) },
                 )
             }
             composable(
@@ -130,6 +134,9 @@ private fun SettingsNavHost(navController: NavHostController) {
             }
             composable(route = SettingsRoutes.PREF_TOOLS) {
                 ToolsPreferencesScreen()
+            }
+            composable(route = SettingsRoutes.DICTIONARY) {
+                DictionaryScreen()
             }
             composable(route = SettingsRoutes.CALIBRATION) {
                 MicCalibrationScreen()

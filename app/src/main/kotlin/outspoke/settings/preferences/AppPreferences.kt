@@ -109,6 +109,17 @@ class AppPreferences(private val context: Context) {
         context.dataStore.edit { prefs -> prefs[keyWhisperLanguage] = tag }
     }
 
+    private val keyUserDictionaryRules = stringPreferencesKey("user_dictionary_rules")
+
+    /** Reguły słownika nazw ASZ (format w [dev.brgr.outspoke.inference.UserDictionary]). */
+    val userDictionaryRules: Flow<String> = context.dataStore.data.map { prefs ->
+        prefs[keyUserDictionaryRules] ?: dev.brgr.outspoke.inference.UserDictionary.DEFAULT_RULES
+    }
+
+    suspend fun setUserDictionaryRules(rules: String) {
+        context.dataStore.edit { prefs -> prefs[keyUserDictionaryRules] = rules }
+    }
+
     private val keyPostprocessingEnabled = booleanPreferencesKey("postprocessing_enabled")
 
     /**
@@ -171,7 +182,9 @@ class AppPreferences(private val context: Context) {
      * Defaults to `null` (auto-detect) so existing installs are unaffected.
      */
     val forcedLanguage: Flow<String?> = context.dataStore.data.map { prefs ->
-        prefs[keyForcedLanguage]   // null when key absent → auto-detect
+        // ASZ: domyślnie polski. Model i tak wykrywa język sam, ale obróbka po transkrypcji
+        // (wypełniacze, liczebniki) przy „auto" udawała angielski i psuła polski tekst.
+        prefs[keyForcedLanguage] ?: "pl"
     }
 
     suspend fun setForcedLanguage(tag: String?) {
