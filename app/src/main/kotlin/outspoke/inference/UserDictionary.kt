@@ -203,6 +203,14 @@ NIS2
 AI Act
 RODO
 GPAI
+# --- z testu serwera 02.09 17:24
+pkob | pko b | pe ka o bp => PKO BP
+clotco | clot co | klotko | clot cod => Claude Code
+clotcowk | clot cowk | clotkowork | clot kowk => Claude Cowork
+to doist | tudoist | tu doist => Todoist
+Todoist
+eact | e act | ej akt | ai akt | aj akt => AI Act
+
 """
     }
 }
