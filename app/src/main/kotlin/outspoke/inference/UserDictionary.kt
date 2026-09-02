@@ -214,6 +214,8 @@ bidwarden | bidłarden | bit varden => Bitwarden
 clotcowerk | clot cowerk | clotkowerk | clot kowerk | klotkowerk => Claude Cowork
 krzyżże | krzysze | krzyszu | krzysiu => Krzysiu
 krzysia | krzyszia => Krzysia
+fejbl | feju | fejbel | fable pięć => Fable
+Fable
 
 """
     }
