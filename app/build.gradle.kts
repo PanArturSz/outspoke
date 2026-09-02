@@ -24,11 +24,23 @@ configure<ApplicationExtension> {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    // ASZ: stały klucz podpisu. Bez niego każda kompilacja w GitHub Actions dostaje nowy klucz
+    // debug, Android odmawia aktualizacji i trzeba odinstalować apkę razem z modelem (700 MB).
+    // Klucz leży w repo — to odpowiednik publicznego klucza debug Androida, nie klucz do sklepu.
+    signingConfigs {
+        create("asz") {
+            storeFile = file("asz-signing.jks")
+            storePassword = "asz-outspoke"
+            keyAlias = "asz"
+            keyPassword = "asz-outspoke"
+        }
+    }
     buildTypes {
         debug {
             // Wersja ASZ instaluje się OBOK oryginalnego Outspoke (inny identyfikator).
             applicationIdSuffix = ".asz"
             versionNameSuffix = "-asz"
+            signingConfig = signingConfigs.getByName("asz")
         }
         release {
             isMinifyEnabled = true
