@@ -62,8 +62,8 @@ fun DictionaryScreen(
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         Text(
-            text = "Jedna reguła na linię. Sama fraza (np. „Claude Code") ustala pisownię i łapie " +
-                "sklejenia oraz wielkość liter. Para „klot kot | clot code => Claude Code" zamienia " +
+            text = "Jedna reguła na linię. Sama fraza (np. „Claude Code”) ustala pisownię i łapie " +
+                "sklejenia oraz wielkość liter. Para „klot kot | clot code => Claude Code” zamienia " +
                 "każde źródło na cel. Znak # zaczyna komentarz.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
