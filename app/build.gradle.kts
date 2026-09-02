@@ -25,6 +25,11 @@ configure<ApplicationExtension> {
     }
 
     buildTypes {
+        debug {
+            // Wersja ASZ instaluje się OBOK oryginalnego Outspoke (inny identyfikator).
+            applicationIdSuffix = ".asz"
+            versionNameSuffix = "-asz"
+        }
         release {
             isMinifyEnabled = true
             isShrinkResources = true

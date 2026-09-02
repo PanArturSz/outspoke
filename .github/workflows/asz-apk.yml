@@ -1,0 +1,56 @@
+name: ASZ — APK z gałęzi asz
+
+on:
+  push:
+    branches: [ "asz" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    name: Zbuduj APK (debug) i wystaw jako asz-latest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      - run: chmod +x ./gradlew
+
+      - name: Testy jednostkowe
+        run: ./gradlew test --no-daemon
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Nazwij pliki
+        run: |
+          set -e
+          mkdir -p out
+          SHA=$(git rev-parse --short HEAD)
+          for f in app/build/outputs/apk/debug/*.apk; do
+            b=$(basename "$f" .apk)
+            abi=$(echo "$b" | sed -E 's/^app-(.*)-debug$/\1/')
+            cp "$f" "out/outspoke-asz-${abi}-${SHA}.apk"
+          done
+          ls -la out
+          echo "SHA=$SHA" >> "$GITHUB_ENV"
+
+      - name: Wystaw wydanie asz-latest (nadpisuje poprzednie)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          gh release delete asz-latest --cleanup-tag -y 2>/dev/null || true
+          gh release create asz-latest out/*.apk \
+            --prerelease \
+            --title "Outspoke ASZ — ${SHA} ($(date -u +%Y-%m-%d\ %H:%M) UTC)" \
+            --notes "Kompilacja debug z gałęzi asz, commit ${SHA}. Plik universal działa na każdym telefonie; arm64-v8a jest mniejszy."
