@@ -264,7 +264,7 @@ class ParakeetEngine : SpeechEngine, ChunkStreamingEngine {
     private var forcedLanguage: String? = null
 
     /** Returns the active language tag for post-processing, defaulting to `"en"` for auto-detect. */
-    override val currentLanguage: String get() = forcedLanguage ?: "en"
+    override val currentLanguage: String get() = forcedLanguage ?: "pl" // ASZ: bez ustawienia polski, nie angielski
 
     /** Implements [SpeechEngine.setLanguage]; stores [tag] for post-processing use. */
     override fun setLanguage(tag: String) {

@@ -100,8 +100,8 @@ class KeyboardViewModel(
      * stable-chunk tracking path).
      */
     val currentLanguage: StateFlow<String> = appPreferences.forcedLanguage
-        .map { it ?: "en" }
-        .stateIn(viewModelScope, SharingStarted.Eagerly, "en")
+        .map { it ?: "pl" }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, "pl")
 
     /**
      * `true` when the transcript post-processing pipeline (filler removal, stutter collapse,
