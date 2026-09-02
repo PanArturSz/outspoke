@@ -81,8 +81,8 @@ class UserDictionary private constructor(
 # „źródło | źródło => cel" = para korekty
 
 # --- przekręcenia, które model robi po polsku
-klot | clot | klod | klaud | claud => Claude
-klot kot | clot code | klod kod | klaud kod | claud code | cloud code | kod klot => Claude Code
+klot | clot | klod | klaud | claud | clode | klode | kloud => Claude
+klot kot | clot code | klod kod | klaud kod | claud code | cloud code | clode code | klode kod | kod klot => Claude Code
 klot kowork | clot cowork | klod kowork | claude kowork => Claude Cowork
 kowork | kołork | co work => Cowork
 antropic | entropic | antropik | anthropik | antropiq => Anthropic
