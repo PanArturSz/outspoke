@@ -47,6 +47,13 @@ class UserDictionaryTest {
     }
 
     @Test
+    fun `frontmatter notatki z vaulta jest pomijany`() {
+        val d = dict("---\ntyp: narzedzie\nsays: Słownik nazw\n---\n# reguły\nPKO BP\n")
+        assertEquals(1, d.size)
+        assertEquals("PKO BP", d.apply("pkobp"))
+    }
+
+    @Test
     fun `polskie znaki są literami na granicy`() {
         val d = dict("Krzyś")
         assertEquals("Krzyś", d.apply("krzyś"))

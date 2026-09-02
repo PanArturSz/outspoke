@@ -45,7 +45,13 @@ class UserDictionary private constructor(
         fun parse(text: String): UserDictionary {
             val rules = mutableListOf<Rule>()
             val errors = mutableListOf<String>()
-            text.lineSequence().forEachIndexed { index, rawLine ->
+            // Notatka z vaulta zaczyna się od frontmatteru YAML między liniami „---" — pomijamy go.
+            val lines = text.lines()
+            val body = if (lines.firstOrNull()?.trim() == "---") {
+                val end = lines.drop(1).indexOfFirst { it.trim() == "---" }
+                if (end >= 0) lines.drop(end + 2) else lines
+            } else lines
+            body.forEachIndexed { index, rawLine ->
                 val line = rawLine.substringBefore('#').trim()
                 if (line.isEmpty()) return@forEachIndexed
                 val sep = SEPARATOR.find(line)
@@ -97,6 +103,9 @@ voltvarden | volt warden | wolt warden => Vaultwarden
 google kalendar | gugle kalendarz | gugiel kalendarz => Google Kalendarz
 google task | google taski | gugle taski => Google Tasks
 ćwiga => śmiga
+terminus | terminius => Termius
+claude cote | claud code | klaud kod => Claude Code
+claud => Claude
 gramatli | gramarli | gramadly | gramerly | gramatly | gramaly => Grammarly
 langłicz tul | language tool | lengłidż tul => LanguageTool
 
